@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "z2rtg_core.h"
+#include "zorro2rtg_regs.h"
 
 static constexpr uae_u32 Z2RTG_SIZE = 0x00400000;   // 4 MB Zorro II board
 static constexpr int Z2RTG_W = 1280, Z2RTG_H = 720;
@@ -44,6 +45,8 @@ struct z2rtg_state {
     std::vector<uae_u8> line;
     uae_u32 last_jobs = 0;
     int trace = 0;               // Z2RTG_TRACE=N: log the first N register writes
+    uae_u32 dump_dst = 0, dump_stride = 0, dump_w = 0, dump_h = 0, dump_fg = 0;   // Z2RTG_TRACE_TPL
+    int trace_blt = 0;           // Z2RTG_TRACE_BLT=N: log the first N blitter jobs
     uae_u32 status_reads = 0;
     uae_u32 hsyncs = 0;
     uae_u32 reg_reads[64] = {};  // reads of each register word $00-$7E, for the trace
@@ -80,6 +83,40 @@ static void z2_advance(z2rtg_state *d)
 
 static void z2_trace(z2rtg_state *d, uae_u32 off, uae_u32 v, int size)
 {
+    if (d->trace_blt > 0 && off == Z2R_REG_BLT_OP && d->tf) {
+        const Z2rtgCore &c = d->core;
+        d->trace_blt--;
+        if (d->dump_w && getenv("Z2RTG_TRACE_TPL")) {   // the last EXPAND's destination, as it is now
+            fprintf(d->tf, "dst of last expand, 16-bit (# = its fg %04x):\n", d->dump_fg);
+            for (unsigned y = 0; y < d->dump_h; y++) {
+                fprintf(d->tf, "  %3u ", y);
+                for (unsigned x = 0; x < d->dump_w; x++) {
+                    const unsigned a = (d->dump_dst + y * d->dump_stride + x * 2) & (Z2rtgCore::VRAM_BYTES - 2);
+                    fputc(((c.vram[a] << 8) | c.vram[a + 1]) == d->dump_fg ? '#' : '.', d->tf);
+                }
+                fputc('\n', d->tf);
+            }
+            d->dump_w = 0;
+        }
+        if (v == Z2R_BLITTER_OP_EXPAND && c.blt_w <= 160 && c.blt_h <= 120) {
+            d->dump_dst = c.blt_dst; d->dump_stride = c.blt_dst_stride; d->dump_w = c.blt_w; d->dump_h = c.blt_h; d->dump_fg = c.blt_fg & 0xffff;
+        }
+        fprintf(d->tf, "blt op %u dst %06x/%u src %06x/%u %ux%u fg %04x bg %04x mode %04x rop %u\n", v, c.blt_dst,
+                c.blt_dst_stride, c.blt_src, c.blt_src_stride, c.blt_w, c.blt_h, c.blt_fg & 0xffff,
+                c.blt_bg & 0xffff, c.blt_mode, c.blt_rop);
+        if (v == Z2R_BLITTER_OP_EXPAND && getenv("Z2RTG_TRACE_TPL") && c.blt_w <= 160 && c.blt_h <= 120) {
+            const unsigned ofs = (c.blt_mode >> Z2R_BLT_MODE_BITOFS_SHIFT) & 15;
+            for (unsigned y = 0; y < c.blt_h; y++) {
+                fprintf(d->tf, "  %3u ", y);
+                for (unsigned x = 0; x < c.blt_w; x++) {
+                    const unsigned b = ofs + x, a = c.sdram_addr(c.blt_src) + y * c.blt_src_stride + (b >> 3);
+                    fputc(a < c.vram.size() && (c.vram[a] & (0x80 >> (b & 7))) ? '#' : '.', d->tf);
+                }
+                fputc('\n', d->tf);
+            }
+        }
+        fflush(d->tf);
+    }
     if (d->trace > 0 && off < 0x10000 && d->tf) {
         d->trace--;
         fprintf(d->tf, "frame %u line %d: wr%d %04x = %04x  busy %u\n", d->core.frame_count, d->core.line,
@@ -337,6 +374,8 @@ static bool z2rtg_init(autoconfig_info *aci)
     d->monitor_id = aci->prefs->rtgboards[aci->devnum].monitor_id;
     if (const char *t = getenv("Z2RTG_TRACE"))
         d->trace = atoi(t);
+    if (const char *t = getenv("Z2RTG_TRACE_BLT"))
+        d->trace_blt = atoi(t);
     if (const char *f = getenv("Z2RTG_TRACE_FILE"))
         d->tf = fopen(f, "w");
     z2rtg_boards[d->devnum] = d;
