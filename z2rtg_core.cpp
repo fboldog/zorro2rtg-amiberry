@@ -28,7 +28,7 @@ void Z2rtgCore::reset()
     blt_dst = blt_src = blt_fg = blt_bg = 0;
     blt_dst_stride = blt_src_stride = blt_w = blt_h = blt_mode = blt_rop = 0;
     dst_hi_st = src_hi_st = fg_hi_st = bg_hi_st = 0;
-    blt_busy_lines = 0;
+    blt_busy_until = 0;
     line = 0;
 }
 
@@ -86,7 +86,7 @@ uint16_t Z2rtgCore::read_reg(uint32_t o)
     case Z2R_REG_STATUS:
         return static_cast<uint16_t>((vblank_latch ? Z2R_STATUS_VBLANK : 0) |
                                      (in_vblank() ? Z2R_STATUS_IN_VBLANK : 0) |
-                                     (blt_busy_lines ? Z2R_STATUS_BLT_BUSY : 0) |
+                                     (blt_busy() ? Z2R_STATUS_BLT_BUSY : 0) |
                                      (blt_err ? Z2R_STATUS_BLT_ERR : 0) |
                                      (scan_pending ? Z2R_STATUS_SCAN_PENDING : 0) |
                                      Z2R_STATUS_PLL_LOCK);
@@ -196,7 +196,7 @@ void Z2rtgCore::write_reg(uint32_t o, uint16_t v, unsigned be)
         if ((be & 1) && (v & 0xF) != Z2R_BLITTER_OP_NOP) {
             unsigned op = v & 0xF;
             bool valid = op >= Z2R_BLITTER_OP_FILL && op <= Z2R_BLITTER_OP_INVERT;   // all four in CAPS
-            if (valid && !blt_busy_lines) blit(op);
+            if (valid && !blt_busy()) blit(op);
             else blt_err = true;
         }
         break;
@@ -207,7 +207,7 @@ void Z2rtgCore::write_reg(uint32_t o, uint16_t v, unsigned be)
 // ------------------------------------------------------------------ timing
 bool Z2rtgCore::hsync()
 {
-    if (blt_busy_lines) blt_busy_lines--;
+    now_ns += LINE_NS;
     if (++line >= LINES_PER_FRAME) line = 0;
     if (line == LINES_PER_FRAME - VBLANK_LINES) { vblank_start(); return true; }
     return false;
@@ -289,5 +289,5 @@ void Z2rtgCore::blit(unsigned op)
     }
     const uint32_t bytes = rb * h * (op == Z2R_BLITTER_OP_COPY ? 2 : 1);
     blt_bytes += bytes;
-    blt_busy_lines = std::max<uint32_t>(1, bytes / BLT_BYTES_PER_LINE);
+    blt_busy_until = now_ns + BLT_SETUP_NS + static_cast<uint64_t>(bytes) * 10 / 3;
 }

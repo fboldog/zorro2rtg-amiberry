@@ -15,7 +15,9 @@ struct Z2rtgCore {
     static constexpr uint16_t K_MODES = 0x0008;         // 1280x720 only
     static constexpr int LINES_PER_FRAME = 260;       // Amiga lines (64 us) per 720p60 frame, about
     static constexpr int VBLANK_LINES = 10;           // 30 of 750 video lines
-    static constexpr uint32_t BLT_BYTES_PER_LINE = 19000;  // ~300 MB/s, the measured fill rate
+    static constexpr uint64_t LINE_NS = 64000;        // one Amiga line
+    static constexpr uint64_t BLT_SETUP_NS = 200;     // per job, a placeholder (VERIFY on the board)
+    // BLT_BUSY time: BLT_SETUP_NS + bytes moved * 10 / 3 ns, about 300 MB/s, the measured fill rate
 
     std::vector<uint8_t> vram;                        // big-endian, byte at address A is vram[A]
 
@@ -39,7 +41,8 @@ struct Z2rtgCore {
     uint32_t blt_dst = 0, blt_src = 0, blt_fg = 0, blt_bg = 0;
     uint16_t blt_dst_stride = 0, blt_src_stride = 0, blt_w = 0, blt_h = 0, blt_mode = 0, blt_rop = 0;
     uint16_t dst_hi_st = 0, src_hi_st = 0, fg_hi_st = 0, bg_hi_st = 0;
-    uint32_t blt_busy_lines = 0;                      // BLT_BUSY stays set for this many hsyncs
+    uint64_t now_ns = 0;                              // model time: hsync() adds a line, an emulator may set it
+    uint64_t blt_busy_until = 0;                      // BLT_BUSY is set while now_ns is below this
     uint32_t blt_jobs = 0, blt_bytes = 0;             // statistics, for tests and the emulator log
 
     int line = 0;                                     // position within the emulated video frame
@@ -59,6 +62,7 @@ struct Z2rtgCore {
     // one Amiga line; returns true at vblank_start
     bool hsync();
     bool in_vblank() const { return line >= LINES_PER_FRAME - VBLANK_LINES; }
+    bool blt_busy() const { return now_ns < blt_busy_until; }
 
     // what the HDMI output shows: false means black (disabled, blanked, unsupported mode or format)
     bool showing() const;

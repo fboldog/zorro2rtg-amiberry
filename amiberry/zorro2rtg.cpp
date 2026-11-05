@@ -22,6 +22,7 @@
 #include "custom.h"
 #include "xwin.h"
 #include "events.h"
+#include "newcpu.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -63,6 +64,7 @@ static void z2_advance(z2rtg_state *d)
     const evt_t now = get_cycles();
     if (now < d->last_cycles || now - d->last_cycles > line * 100000) {
         d->last_cycles = now;              // first call, or a jump (reset, state load): resync
+        d->core.blt_busy_until = 0;
         return;
     }
     while (now - d->last_cycles >= line) {
@@ -79,6 +81,9 @@ static void z2_advance(z2rtg_state *d)
             fflush(d->tf);
         }
     }
+    // BLT_BUSY at CPU-cycle resolution: model time = the lines done + the part of the current one
+    d->core.now_ns = d->core.now_ns - d->core.now_ns % Z2rtgCore::LINE_NS +
+                     static_cast<uint64_t>(now - d->last_cycles) * Z2rtgCore::LINE_NS / static_cast<uint64_t>(line);
 }
 
 static void z2_trace(z2rtg_state *d, uae_u32 off, uae_u32 v, int size)
@@ -120,12 +125,22 @@ static void z2_trace(z2rtg_state *d, uae_u32 off, uae_u32 v, int size)
     if (d->trace > 0 && off < 0x10000 && d->tf) {
         d->trace--;
         fprintf(d->tf, "frame %u line %d: wr%d %04x = %04x  busy %u\n", d->core.frame_count, d->core.line,
-                size, off, v, d->core.blt_busy_lines);
+                size, off, v, d->core.blt_busy() ? 1u : 0u);
         fflush(d->tf);
     }
 }
 
 static z2rtg_state *z2rtg_boards[MAX_RTG_BOARDS];
+
+// Zorro II bus time per word access, in colour clocks (281.9 ns): a cycle is 4 clocks of 7.09 MHz,
+// 2 colour clocks. Writes go into the card's posted-write FIFO, reads hold XRDY until the data is back.
+// Placeholders, VERIFY on the A2000 (z2test BENCH). Z2RTG_BUS=0 turns the charge off.
+static int z2_bus_write = 2, z2_bus_read = 3;
+static inline void z2_bus(int ccks)
+{
+    if (ccks)
+        x_do_cycles(ccks * CYCLE_UNIT);
+}
 
 static z2rtg_state *z2_find(uaecptr addr)
 {
@@ -141,6 +156,7 @@ static uae_u32 REGPARAM2 z2rtg_wget(uaecptr addr)
     if (!d)
         return 0;
     z2_advance(d);
+    z2_bus(z2_bus_read);
     if (addr - d->configured == 8)
         d->status_reads++;
     if (addr - d->configured < 0x80)
@@ -157,6 +173,7 @@ static uae_u32 REGPARAM2 z2rtg_bget(uaecptr addr)
     if (!d)
         return 0;
     z2_advance(d);
+    z2_bus(z2_bus_read);
     return d->core.read8(addr - d->configured);
 }
 static void REGPARAM2 z2rtg_wput(uaecptr addr, uae_u32 v)
@@ -164,6 +181,7 @@ static void REGPARAM2 z2rtg_wput(uaecptr addr, uae_u32 v)
     z2rtg_state *d = z2_find(addr);
     if (d) {
         z2_advance(d);
+        z2_bus(z2_bus_write);
         z2_trace(d, addr - d->configured, v & 0xffff, 2);
         d->core.write16(addr - d->configured, static_cast<uint16_t>(v), 3);
     }
@@ -178,6 +196,7 @@ static void REGPARAM2 z2rtg_bput(uaecptr addr, uae_u32 v)
     z2rtg_state *d = z2_find(addr);
     if (d) {
         z2_advance(d);
+        z2_bus(z2_bus_write);
         z2_trace(d, addr - d->configured, v & 0xff, 1);
         d->core.write8(addr - d->configured, static_cast<uint8_t>(v));
     }
@@ -191,6 +210,7 @@ static inline uae_u8 *z2_vram_at(z2rtg_state *d, uaecptr addr)
 static uae_u32 REGPARAM2 z2rtg_vram_lget(uaecptr addr)
 {
     z2rtg_state *d = z2_find(addr);
+    z2_bus(2 * z2_bus_read);
     if (!d) return 0;
     const uae_u8 *p = z2_vram_at(d, addr);
     return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
@@ -198,6 +218,7 @@ static uae_u32 REGPARAM2 z2rtg_vram_lget(uaecptr addr)
 static uae_u32 REGPARAM2 z2rtg_vram_wget(uaecptr addr)
 {
     z2rtg_state *d = z2_find(addr);
+    z2_bus(z2_bus_read);
     if (!d) return 0;
     const uae_u8 *p = z2_vram_at(d, addr);
     return (p[0] << 8) | p[1];
@@ -205,11 +226,13 @@ static uae_u32 REGPARAM2 z2rtg_vram_wget(uaecptr addr)
 static uae_u32 REGPARAM2 z2rtg_vram_bget(uaecptr addr)
 {
     z2rtg_state *d = z2_find(addr);
+    z2_bus(z2_bus_read);
     return d ? *z2_vram_at(d, addr) : 0;
 }
 static void REGPARAM2 z2rtg_vram_lput(uaecptr addr, uae_u32 v)
 {
     z2rtg_state *d = z2_find(addr);
+    z2_bus(2 * z2_bus_write);
     if (!d) return;
     uae_u8 *p = z2_vram_at(d, addr);
     p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
@@ -217,6 +240,7 @@ static void REGPARAM2 z2rtg_vram_lput(uaecptr addr, uae_u32 v)
 static void REGPARAM2 z2rtg_vram_wput(uaecptr addr, uae_u32 v)
 {
     z2rtg_state *d = z2_find(addr);
+    z2_bus(z2_bus_write);
     if (!d) return;
     uae_u8 *p = z2_vram_at(d, addr);
     p[0] = v >> 8; p[1] = v;
@@ -224,6 +248,7 @@ static void REGPARAM2 z2rtg_vram_wput(uaecptr addr, uae_u32 v)
 static void REGPARAM2 z2rtg_vram_bput(uaecptr addr, uae_u32 v)
 {
     z2rtg_state *d = z2_find(addr);
+    z2_bus(z2_bus_write);
     if (d) *z2_vram_at(d, addr) = v;
 }
 static uae_u8 *REGPARAM2 z2rtg_vram_xlate(uaecptr addr)
@@ -374,6 +399,8 @@ static bool z2rtg_init(autoconfig_info *aci)
     d->monitor_id = aci->prefs->rtgboards[aci->devnum].monitor_id;
     if (const char *t = getenv("Z2RTG_TRACE"))
         d->trace = atoi(t);
+    if (const char *t = getenv("Z2RTG_BUS"); t && !atoi(t))
+        z2_bus_write = z2_bus_read = 0;
     if (const char *t = getenv("Z2RTG_TRACE_BLT"))
         d->trace_blt = atoi(t);
     if (const char *f = getenv("Z2RTG_TRACE_FILE"))
