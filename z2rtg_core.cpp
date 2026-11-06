@@ -245,8 +245,12 @@ bool Z2rtgCore::cursor_pixel(int x, int y, uint32_t &rgb) const
 bool Z2rtgCore::showing() const
 {
     return (ctrl_act & Z2R_CTRL_VIDEO_EN) && !(ctrl_act & Z2R_CTRL_BLANK) &&
-           mode_act == Z2R_MODE_PRESET_M1280X720 && format_act == Z2R_PIXEL_FORMAT_RGB565;
+           mode_act < 16 && ((K_MODES >> mode_act) & 1) && format_act == Z2R_PIXEL_FORMAT_RGB565;
 }
+
+static const int mode_w[4] = {640, 800, 1024, 1280}, mode_h[4] = {480, 600, 768, 720};
+int Z2rtgCore::width() const { return mode_act < 4 ? mode_w[mode_act] : 1280; }
+int Z2rtgCore::height() const { return mode_act < 4 ? mode_h[mode_act] : 720; }
 
 // ------------------------------------------------------------------ blitter (as sim/blitter/tb_blitter.v)
 static uint8_t rop8(unsigned rop, uint8_t s, uint8_t d)

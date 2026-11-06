@@ -11,6 +11,8 @@ unsigned z2_rd8(void *c, unsigned off) { return static_cast<Z2rtgCore *>(c)->rea
 void z2_wr8(void *c, unsigned off, unsigned v) { static_cast<Z2rtgCore *>(c)->write8(off, v); }
 int z2_hsync(void *c) { return static_cast<Z2rtgCore *>(c)->hsync(); }
 int z2_showing(void *c) { return static_cast<Z2rtgCore *>(c)->showing(); }
+int z2_width(void *c) { return static_cast<Z2rtgCore *>(c)->width(); }
+int z2_height(void *c) { return static_cast<Z2rtgCore *>(c)->height(); }
 unsigned char *z2_vram(void *c) { return static_cast<Z2rtgCore *>(c)->vram.data(); }
 unsigned z2_scan_base_act(void *c) { return static_cast<Z2rtgCore *>(c)->scan_base_act; }
 // the cursor's colour at (x, y) of the shown frame, -1 where it is transparent or off

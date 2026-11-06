@@ -3,7 +3,7 @@
  *
  * Glue between Amiberry's gfxboard_func interface and the emulator-independent board model in
  * z2rtg_core.cpp, which implements docs/registers.md of the Zorro2-Tang25k project: register file,
- * 8 MB VRAM window, scanout (1280x720 RGB565 only, as the gateware) and the blitter.
+ * 8 MB VRAM window, scanout (640x480 to 1280x720 in RGB565, as the gateware) and the blitter.
  * The register area (the first 64 KB) is an I/O bank through the model; the VRAM and staging window
  * above it is a RAM bank on the model's VRAM (with BANK), as the ZZ9000 model maps its VRAM.
  * The model's time (its 64 us lines: blitter busy time, vertical blank, FRAME_COUNT) follows the emulated
@@ -35,7 +35,6 @@
 #include "zorro2rtg_regs.h"
 
 static constexpr uae_u32 Z2RTG_SIZE = 0x00400000;   // 4 MB Zorro II board
-static constexpr int Z2RTG_W = 1280, Z2RTG_H = 720;
 
 struct z2rtg_state {
     Z2rtgCore core;
@@ -43,6 +42,7 @@ struct z2rtg_state {
     int monitor_id = 0;
     uae_u32 configured = 0;
     bool enabled = false;       // Amiberry has this board's display selected (toggle)
+    int shown_w = 0, shown_h = 0; // the size Amiberry's RTG view was last set to
     bool rtg_on = false;        // last value passed to gfxboard_set
     bool mode_changed = true;
     std::vector<uae_u8> line;
@@ -347,22 +347,27 @@ static bool z2rtg_vsync(void *userdata, gfxboard_mode *mode)
     auto *d = static_cast<z2rtg_state *>(userdata);
     if (!d->configured || !d->enabled)
         return false;
-    mode->width = Z2RTG_W;
-    mode->height = Z2RTG_H;
+    const int W = d->core.width(), H = d->core.height();   // the active MODE (applied at vertical blank)
+    if (W != d->shown_w || H != d->shown_h) {
+        d->shown_w = W; d->shown_h = H;
+        d->mode_changed = true;
+    }
+    mode->width = W;
+    mode->height = H;
     mode->mode = RGBFB_R5G6B5;             // big-endian RGB565, as stored in VRAM
     mode->hlinedbl = 1;
     mode->vlinedbl = 1;
     const auto &state = picasso96_state[d->monitor_id];
-    if (d->mode_changed && (state.Width != Z2RTG_W || state.Height != Z2RTG_H || state.RGBFormat != RGBFB_R5G6B5))
+    if (d->mode_changed && (state.Width != W || state.Height != H || state.RGBFormat != RGBFB_R5G6B5))
         return true;                       // let Amiberry resize first
     uae_u8 *surface = gfx_lock_picasso(d->monitor_id, false);
     if (!surface)
         return false;
-    const size_t line_size = Z2RTG_W * 2;
+    const size_t line_size = W * 2;
     d->line.resize(line_size);
     const bool show = d->core.showing();
     const uint32_t base = d->core.scan_base_act & ~31u, stride = d->core.stride_act & ~31u;
-    for (int y = 0; y < Z2RTG_H; y++) {
+    for (int y = 0; y < H; y++) {
         if (show)
             for (size_t i = 0; i < line_size; i++)
                 d->line[i] = d->core.vram[(base + y * stride + i) & (Z2rtgCore::VRAM_BYTES - 1)];
@@ -371,7 +376,7 @@ static bool z2rtg_vsync(void *userdata, gfxboard_mode *mode)
         // the hardware cursor over the line, reduced to the frame's RGB565
         if (show && d->core.cursor_en_act && !d->no_cursor && y >= d->core.cursor_y_act && y < d->core.cursor_y_act + 64)
             for (int x = std::max(0, static_cast<int>(d->core.cursor_x_act));
-                 x < std::min(Z2RTG_W, d->core.cursor_x_act + 64); x++) {
+                 x < std::min(W, d->core.cursor_x_act + 64); x++) {
                 uint32_t c;
                 if (d->core.cursor_pixel(x, y, c)) {
                     const uint16_t p = static_cast<uint16_t>(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
@@ -379,7 +384,7 @@ static bool z2rtg_vsync(void *userdata, gfxboard_mode *mode)
                     d->line[2 * x + 1] = static_cast<uae_u8>(p);
                 }
             }
-        fb_copyrow(d->monitor_id, d->line.data(), surface, 0, 0, Z2RTG_W, 2, y);
+        fb_copyrow(d->monitor_id, d->line.data(), surface, 0, 0, W, 2, y);
     }
     d->mode_changed = false;
     gfx_unlock_picasso(d->monitor_id, true);

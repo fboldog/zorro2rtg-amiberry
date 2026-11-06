@@ -12,7 +12,7 @@ struct Z2rtgCore {
     static constexpr uint32_t VRAM_BYTES = 8u << 20;
     static constexpr uint16_t K_ID = 0x5A32, K_VERSION = 0x0001;
     static constexpr uint16_t K_CAPS = 0x01EA;          // as rtl/top/zorro2rtg_top.v (with CURSOR)
-    static constexpr uint16_t K_MODES = 0x0008;         // 1280x720 only
+    static constexpr uint16_t K_MODES = 0x000F;         // 640x480, 800x600, 1024x768, 1280x720, as the gateware
     static constexpr int LINES_PER_FRAME = 260;       // Amiga lines (64 us) per 720p60 frame, about
     static constexpr int VBLANK_LINES = 10;           // 30 of 750 video lines
     static constexpr uint64_t LINE_NS = 64000;        // one Amiga line
@@ -70,6 +70,9 @@ struct Z2rtgCore {
 
     // what the HDMI output shows: false means black (disabled, blanked, unsupported mode or format)
     bool showing() const;
+    // the active mode's size (MODE_PRESET, rtl/video/video_mode.v); 1280x720 for an unsupported one
+    int width() const;
+    int height() const;
 
     // the cursor's 8:8:8 colour at screen pixel (x, y) of the shown frame, or false where it is transparent
     bool cursor_pixel(int x, int y, uint32_t &rgb) const;
