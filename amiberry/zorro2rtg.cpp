@@ -24,6 +24,7 @@
 #include "events.h"
 #include "newcpu.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
@@ -47,6 +48,7 @@ struct z2rtg_state {
     uae_u32 last_jobs = 0;
     int trace = 0;               // Z2RTG_TRACE=N: log the first N register writes
     uae_u32 dump_dst = 0, dump_stride = 0, dump_w = 0, dump_h = 0, dump_fg = 0;   // Z2RTG_TRACE_TPL
+    bool no_cursor = false;      // Z2RTG_NOCURSOR=1: leave the hardware cursor out (shows it is the one drawn)
     int trace_blt = 0;           // Z2RTG_TRACE_BLT=N: log the first N blitter jobs
     uae_u32 status_reads = 0;
     uae_u32 hsyncs = 0;
@@ -328,6 +330,17 @@ static bool z2rtg_vsync(void *userdata, gfxboard_mode *mode)
                 d->line[i] = d->core.vram[(base + y * stride + i) & (Z2rtgCore::VRAM_BYTES - 1)];
         else
             memset(d->line.data(), 0, line_size);
+        // the hardware cursor over the line, reduced to the frame's RGB565
+        if (show && d->core.cursor_en_act && !d->no_cursor && y >= d->core.cursor_y_act && y < d->core.cursor_y_act + 64)
+            for (int x = std::max(0, static_cast<int>(d->core.cursor_x_act));
+                 x < std::min(Z2RTG_W, d->core.cursor_x_act + 64); x++) {
+                uint32_t c;
+                if (d->core.cursor_pixel(x, y, c)) {
+                    const uint16_t p = static_cast<uint16_t>(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
+                    d->line[2 * x] = static_cast<uae_u8>(p >> 8);
+                    d->line[2 * x + 1] = static_cast<uae_u8>(p);
+                }
+            }
         fb_copyrow(d->monitor_id, d->line.data(), surface, 0, 0, Z2RTG_W, 2, y);
     }
     d->mode_changed = false;
@@ -401,6 +414,8 @@ static bool z2rtg_init(autoconfig_info *aci)
         d->trace = atoi(t);
     if (const char *t = getenv("Z2RTG_BUS"); t && !atoi(t))
         z2_bus_write = z2_bus_read = 0;
+    if (const char *t = getenv("Z2RTG_NOCURSOR"))
+        d->no_cursor = atoi(t) != 0;
     if (const char *t = getenv("Z2RTG_TRACE_BLT"))
         d->trace_blt = atoi(t);
     if (const char *f = getenv("Z2RTG_TRACE_FILE"))

@@ -24,6 +24,8 @@ void Z2rtgCore::reset()
     scan_base = 0; scan_base_hi_st = 0; vblank_latch = blt_err = scan_pending = false;
     ctrl_act = 0; mode_act = 0; format_act = 1; stride_act = 0x0A00; scan_base_act = 0;
     cursor_x = cursor_y = 0;
+    cursor_en_act = false; cursor_x_act = cursor_y_act = 0;
+    for (int i = 0; i < 3; i++) cursor_col_act[i] = 0;
     for (int i = 0; i < 3; i++) { cursor_col[i] = 0; cursor_col_hi_st[i] = 0; }
     blt_dst = blt_src = blt_fg = blt_bg = 0;
     blt_dst_stride = blt_src_stride = blt_w = blt_h = blt_mode = blt_rop = 0;
@@ -217,9 +219,27 @@ void Z2rtgCore::vblank_start()
 {
     ctrl_act = ctrl; mode_act = mode; format_act = format; stride_act = stride;
     scan_base_act = scan_base;
+    cursor_en_act = (ctrl & Z2R_CTRL_CURSOR_EN) != 0;
+    cursor_x_act = static_cast<int16_t>(cursor_x);
+    cursor_y_act = static_cast<int16_t>(cursor_y);
+    for (int i = 0; i < 3; i++) cursor_col_act[i] = cursor_col[i];
     scan_pending = false;
     vblank_latch = true;
     frame_count++;
+}
+
+bool Z2rtgCore::cursor_pixel(int x, int y, uint32_t &rgb) const
+{
+    const int dx = x - cursor_x_act, dy = y - cursor_y_act;
+    if (!cursor_en_act || dx < 0 || dx >= 64 || dy < 0 || dy >= 64)
+        return false;
+    // CURSOR_IMG: per row four words of plane 0, then four of plane 1, MSB first
+    const unsigned byte = dy * 16 + (dx >> 3), bit = 7 - (dx & 7);
+    const unsigned idx = ((cursor_img[byte] >> bit) & 1) | (((cursor_img[byte + 8] >> bit) & 1) << 1);
+    if (!idx)
+        return false;
+    rgb = cursor_col_act[idx - 1];
+    return true;
 }
 
 bool Z2rtgCore::showing() const

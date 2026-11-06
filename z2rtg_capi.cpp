@@ -13,4 +13,6 @@ int z2_hsync(void *c) { return static_cast<Z2rtgCore *>(c)->hsync(); }
 int z2_showing(void *c) { return static_cast<Z2rtgCore *>(c)->showing(); }
 unsigned char *z2_vram(void *c) { return static_cast<Z2rtgCore *>(c)->vram.data(); }
 unsigned z2_scan_base_act(void *c) { return static_cast<Z2rtgCore *>(c)->scan_base_act; }
+// the cursor's colour at (x, y) of the shown frame, -1 where it is transparent or off
+long z2_cursor_pixel(void *c, int x, int y) { uint32_t v; return static_cast<Z2rtgCore *>(c)->cursor_pixel(x, y, v) ? static_cast<long>(v) : -1; }
 }
