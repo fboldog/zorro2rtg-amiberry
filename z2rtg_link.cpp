@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
 #include <poll.h>
 #include <termios.h>
 #include <unistd.h>
@@ -15,6 +16,7 @@
 
 static constexpr unsigned BURST = 256;       // words per bridge burst
 static constexpr int WINDOW = 4;             // bursts in flight (docs/debug_bridge.md)
+static constexpr uint32_t VRAM_START = 0x010000;   // below: registers, palette, cursor image (kept in order)
 
 Z2rtgLink::~Z2rtgLink() { close(); }
 
@@ -215,6 +217,7 @@ bool Z2rtgLink::blitter_idle()
         uint8_t r[2];
         if (!send(cmd, 4) || recv(r, 2, 500) != 2) {
             errors++;
+            if (log) fprintf(log, "z2rtg link: no answer to a STATUS read, retrying\n");
             usleep(30000);                       // a refused read: resynchronise and ask again
             tcflush(fd, TCIFLUSH);
             continue;
@@ -222,6 +225,7 @@ bool Z2rtgLink::blitter_idle()
         if (!((r[0] << 8 | r[1]) & Z2R_STATUS_BLT_BUSY))
             return true;
     }
+    if (log) fprintf(log, "z2rtg link: the real BLT_BUSY did not clear\n");
     return false;
 }
 
@@ -229,6 +233,7 @@ void Z2rtgLink::run()
 {
     std::vector<Item> work;
     std::vector<uint16_t> run_w;
+    auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     for (;;) {
         {
             std::unique_lock<std::mutex> g(mx);
@@ -238,20 +243,46 @@ void Z2rtgLink::run()
             work.assign(q.begin(), q.end());
             q.clear();
         }
-        // a failure has been logged and recovered as far as possible: carry on with the rest
+        std::map<uint32_t, uint16_t> seg;
         for (size_t i = 0; i < work.size();) {
+            // progress every 10 s: a link far behind the emulated board shows as a growing backlog
+            if (log && std::chrono::steady_clock::now() >= next_report) {
+                next_report += std::chrono::seconds(10);
+                fprintf(log, "z2rtg link: %llu words in %llu bursts, %llu polls, %llu errors, %zu writes waiting\n",
+                        (unsigned long long)words, (unsigned long long)bursts, (unsigned long long)polls,
+                        (unsigned long long)errors, work.size() - i);
+                fflush(log);
+            }
             if (work[i].wait) {
                 blitter_idle();
                 i++;
                 continue;
             }
-            // consecutive offsets become one burst
-            uint32_t start = work[i].off;
-            run_w.clear();
-            while (i < work.size() && !work[i].wait && run_w.size() < BURST &&
-                   work[i].off == start + 2 * run_w.size())
-                run_w.push_back(work[i++].v);
-            burst(start, run_w.data(), static_cast<unsigned>(run_w.size()));
+            if (work[i].off < VRAM_START) {
+                // registers in order; consecutive offsets become one burst
+                uint32_t start = work[i].off;
+                run_w.clear();
+                while (i < work.size() && !work[i].wait && work[i].off < VRAM_START && run_w.size() < BURST &&
+                       work[i].off == start + 2 * run_w.size())
+                    run_w.push_back(work[i++].v);
+                burst(start, run_w.data(), static_cast<unsigned>(run_w.size()));
+                continue;
+            }
+            // VRAM up to the next register write or blitter wait: the order inside does not matter, only
+            // each word's last value, so the words go sorted, as long bursts (a CPU clearing memory
+            // backwards would otherwise give one burst per longword)
+            seg.clear();
+            while (i < work.size() && !work[i].wait && work[i].off >= VRAM_START) {
+                seg[work[i].off] = work[i].v;
+                i++;
+            }
+            for (auto it = seg.begin(); it != seg.end();) {
+                uint32_t start = it->first;
+                run_w.clear();
+                while (it != seg.end() && run_w.size() < BURST && it->first == start + 2 * run_w.size())
+                    run_w.push_back((it++)->second);
+                burst(start, run_w.data(), static_cast<unsigned>(run_w.size()));
+            }
         }
         drain();
     }
