@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Adds the Zorro2RTG board to an Amiberry v8.5.0 source tree (docs/driver.md).
     integrate.py AMIBERRY_SRC
-Copies the board model in and makes five small edits, each skipped if already present, so it can be
+Copies the board model in and makes six small edits, each skipped if already present, so it can be
 run again. Fails if an anchor line is missing (a different Amiberry version)."""
 import pathlib
 import shutil
@@ -28,6 +28,8 @@ def main():
     shutil.copy(HERE / "zorro2rtg.cpp", src / "src" / "zorro2rtg.cpp")
     shutil.copy(ROOT / "sw/emu/z2rtg_core.cpp", src / "src" / "z2rtg_core.cpp")
     shutil.copy(ROOT / "sw/emu/z2rtg_core.h", src / "src" / "include" / "z2rtg_core.h")
+    shutil.copy(ROOT / "sw/emu/z2rtg_link.cpp", src / "src" / "z2rtg_link.cpp")
+    shutil.copy(ROOT / "sw/emu/z2rtg_link.h", src / "src" / "include" / "z2rtg_link.h")
     shutil.copy(ROOT / "sw/p96/zorro2rtg_regs.h", src / "src" / "include" / "zorro2rtg_regs.h")
     h = src / "src/include/gfxboard.h"
     edit(h, "#define GFXBOARD_ID_ZZ9000_Z3 44\n", "#define GFXBOARD_ID_ZORRO2RTG 45\n")
@@ -48,6 +50,7 @@ def main():
          " rbc->rtgmem_type != GFXBOARD_ID_ZORRO2RTG &&", marker="GFXBOARD_ID_ZORRO2RTG")
     c = src / "cmake/SourceFiles.cmake"
     edit(c, "        src/zz9000.cpp\n", "        src/zorro2rtg.cpp\n        src/z2rtg_core.cpp\n")
+    edit(c, "        src/z2rtg_core.cpp\n", "        src/z2rtg_link.cpp\n")
 
 
 if __name__ == "__main__":

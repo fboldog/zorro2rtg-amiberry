@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "z2rtg_core.h"
+#include "z2rtg_link.h"
 #include "zorro2rtg_regs.h"
 
 static constexpr uae_u32 Z2RTG_SIZE = 0x00400000;   // 4 MB Zorro II board
@@ -54,6 +55,7 @@ struct z2rtg_state {
     uae_u32 hsyncs = 0;
     uae_u32 reg_reads[64] = {};  // reads of each register word $00-$7E, for the trace
     FILE *tf = nullptr;          // Z2RTG_TRACE_FILE: trace written here, flushed per line
+    Z2rtgLink link;              // Z2RTG_BRIDGE=/dev/ttyUSBn: mirror every write to a real Nano 20K
     evt_t last_cycles = 0;
 };
 
@@ -178,6 +180,29 @@ static uae_u32 REGPARAM2 z2rtg_bget(uaecptr addr)
     z2_bus(z2_bus_read);
     return d->core.read8(addr - d->configured);
 }
+static inline uae_u8 *z2_vram_at(z2rtg_state *d, uaecptr addr);
+// ---- board in the loop (sw/emu/z2rtg_link.h): every write the model takes goes to the real board too
+static constexpr uint32_t Z2_LINK_WAIT_BYTES = 16384;  // longer jobs: wait for the real blitter. The bridge
+                                                      // buffers 64 bytes (about 210 us at 3 Mbaud) while a job
+                                                      // holds its writes back; 16 KB is about 55 us
+static void z2_link_reg(z2rtg_state *d, uint32_t off, uint16_t v, uint32_t jobs_before, uint32_t bytes_before)
+{
+    if (!d->link.is_open())
+        return;
+    d->link.write(off, v);
+    // a job the model started: wait for the real one when it may outlast the next command on the UART
+    if ((off & ~1u) == Z2R_REG_BLT_OP && d->core.blt_jobs != jobs_before &&
+        d->core.blt_bytes - bytes_before >= Z2_LINK_WAIT_BYTES)
+        d->link.wait_blitter();
+}
+static void z2_link_vram(z2rtg_state *d, uaecptr addr)
+{
+    if (!d->link.is_open())
+        return;
+    const uae_u8 *p = z2_vram_at(d, addr & ~1u);
+    d->link.write((addr - d->configured) & ~1u, static_cast<uint16_t>((p[0] << 8) | p[1]));
+}
+
 static void REGPARAM2 z2rtg_wput(uaecptr addr, uae_u32 v)
 {
     z2rtg_state *d = z2_find(addr);
@@ -185,7 +210,9 @@ static void REGPARAM2 z2rtg_wput(uaecptr addr, uae_u32 v)
         z2_advance(d);
         z2_bus(z2_bus_write);
         z2_trace(d, addr - d->configured, v & 0xffff, 2);
+        const uint32_t jobs = d->core.blt_jobs, bytes = d->core.blt_bytes;
         d->core.write16(addr - d->configured, static_cast<uint16_t>(v), 3);
+        z2_link_reg(d, addr - d->configured, static_cast<uint16_t>(v), jobs, bytes);
     }
 }
 static void REGPARAM2 z2rtg_lput(uaecptr addr, uae_u32 v)
@@ -200,7 +227,13 @@ static void REGPARAM2 z2rtg_bput(uaecptr addr, uae_u32 v)
         z2_advance(d);
         z2_bus(z2_bus_write);
         z2_trace(d, addr - d->configured, v & 0xff, 1);
-        d->core.write8(addr - d->configured, static_cast<uint8_t>(v));
+        const uint32_t off = addr - d->configured, jobs = d->core.blt_jobs, bytes = d->core.blt_bytes;
+        d->core.write8(off, static_cast<uint8_t>(v));
+        // the bridge writes whole words: the byte in its lane, the other lane as the model now reads it
+        // (STATUS: 0, so no other W1C bit is cleared)
+        uint16_t w = (off & ~1u) == Z2R_REG_STATUS ? 0 : d->core.read16(off & ~1u);
+        w = (off & 1) ? static_cast<uint16_t>((w & 0xFF00) | (v & 0xFF)) : static_cast<uint16_t>((w & 0x00FF) | ((v & 0xFF) << 8));
+        z2_link_reg(d, off & ~1u, w, jobs, bytes);
     }
 }
 
@@ -238,6 +271,8 @@ static void REGPARAM2 z2rtg_vram_lput(uaecptr addr, uae_u32 v)
     if (!d) return;
     uae_u8 *p = z2_vram_at(d, addr);
     p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
+    z2_link_vram(d, addr);
+    z2_link_vram(d, addr + 2);
 }
 static void REGPARAM2 z2rtg_vram_wput(uaecptr addr, uae_u32 v)
 {
@@ -246,12 +281,15 @@ static void REGPARAM2 z2rtg_vram_wput(uaecptr addr, uae_u32 v)
     if (!d) return;
     uae_u8 *p = z2_vram_at(d, addr);
     p[0] = v >> 8; p[1] = v;
+    z2_link_vram(d, addr);
 }
 static void REGPARAM2 z2rtg_vram_bput(uaecptr addr, uae_u32 v)
 {
     z2rtg_state *d = z2_find(addr);
     z2_bus(z2_bus_write);
-    if (d) *z2_vram_at(d, addr) = v;
+    if (!d) return;
+    *z2_vram_at(d, addr) = v;
+    z2_link_vram(d, addr);
 }
 static uae_u8 *REGPARAM2 z2rtg_vram_xlate(uaecptr addr)
 {
@@ -373,6 +411,15 @@ static void z2rtg_configured(void *userdata, uae_u32 address)
     // registers stay in the I/O bank mapped by gfxboard.cpp; VRAM and staging become memory
     map_banks(&z2rtg_vram_bank, (address + 0x10000) >> 16, (Z2RTG_SIZE - 0x10000) >> 16, 0);
     write_log(_T("Zorro2RTG configured at %08x\n"), address);
+    if (const char *dev = getenv("Z2RTG_BRIDGE")) {
+        const char *b = getenv("Z2RTG_BRIDGE_BAUD");
+        if (d->link.is_open() || d->link.open(dev, b ? atoi(b) : 3000000, d->tf ? d->tf : stderr)) {
+            // the real board starts from the model's power-on state
+            d->link.write(Z2R_REG_CTRL, 0);
+            d->link.write(Z2R_REG_BANK, 0);
+            d->link.write(Z2R_REG_STATUS, Z2R_STATUS_VBLANK | Z2R_STATUS_BLT_ERR);
+        }
+    }
 }
 
 static void z2rtg_refresh(void *userdata)
@@ -397,6 +444,7 @@ static void z2rtg_free(void *userdata)
         return;
     if (d->devnum >= 0 && d->devnum < MAX_RTG_BOARDS)
         z2rtg_boards[d->devnum] = nullptr;
+    d->link.close();
     delete d;
 }
 
