@@ -11,7 +11,7 @@
 struct Z2rtgCore {
     static constexpr uint32_t VRAM_BYTES = 8u << 20;
     static constexpr uint16_t K_ID = 0x5A32, K_VERSION = 0x0001;
-    static constexpr uint16_t K_CAPS = 0x01EA;          // as rtl/top/zorro2rtg_top.v (with CURSOR)
+    static constexpr uint16_t K_CAPS = 0x01EB;          // as rtl/top/zorro2rtg_top.v (CLUT8, RGB565, CURSOR, blitter)
     static constexpr uint16_t K_MODES = 0x000F;         // 640x480, 800x600, 1024x768, 1280x720, as the gateware
     static constexpr int LINES_PER_FRAME = 260;       // Amiga lines (64 us) per 720p60 frame, about
     static constexpr int VBLANK_LINES = 10;           // 30 of 750 video lines
@@ -29,7 +29,7 @@ struct Z2rtgCore {
     // active copies, loaded at vertical blank
     uint16_t ctrl_act = 0, mode_act = 0, format_act = 1, stride_act = 0x0A00;
     uint32_t scan_base_act = 0;
-    // cursor (shown over the scanout, as rtl/video/cursor.v) and palette (stored, CLUT8 not shown)
+    // cursor (shown over the scanout, as rtl/video/cursor.v) and palette (8:8:8, used by CLUT8 scanout)
     uint16_t cursor_x = 0, cursor_y = 0;
     uint32_t cursor_col[3] = {0, 0, 0};
     uint16_t cursor_col_hi_st[3] = {0, 0, 0};

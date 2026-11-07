@@ -245,7 +245,8 @@ bool Z2rtgCore::cursor_pixel(int x, int y, uint32_t &rgb) const
 bool Z2rtgCore::showing() const
 {
     return (ctrl_act & Z2R_CTRL_VIDEO_EN) && !(ctrl_act & Z2R_CTRL_BLANK) &&
-           mode_act < 16 && ((K_MODES >> mode_act) & 1) && format_act == Z2R_PIXEL_FORMAT_RGB565;
+           mode_act < 16 && ((K_MODES >> mode_act) & 1) &&
+           (format_act == Z2R_PIXEL_FORMAT_RGB565 || format_act == Z2R_PIXEL_FORMAT_CLUT8);
 }
 
 static const int mode_w[4] = {640, 800, 1024, 1280}, mode_h[4] = {480, 600, 768, 720};

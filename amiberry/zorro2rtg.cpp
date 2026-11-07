@@ -3,7 +3,7 @@
  *
  * Glue between Amiberry's gfxboard_func interface and the emulator-independent board model in
  * z2rtg_core.cpp, which implements docs/registers.md of the Zorro2-Tang25k project: register file,
- * 8 MB VRAM window, scanout (640x480 to 1280x720 in RGB565, as the gateware) and the blitter.
+ * 8 MB VRAM window, scanout (640x480 to 1280x720 in RGB565 and CLUT8, as the gateware) and the blitter.
  * The register area (the first 64 KB) is an I/O bank through the model; the VRAM and staging window
  * above it is a RAM bank on the model's VRAM (with BANK), as the ZZ9000 model maps its VRAM.
  * The model's time (its 64 us lines: blitter busy time, vertical blank, FRAME_COUNT) follows the emulated
@@ -368,7 +368,15 @@ static bool z2rtg_vsync(void *userdata, gfxboard_mode *mode)
     const bool show = d->core.showing();
     const uint32_t base = d->core.scan_base_act & ~31u, stride = d->core.stride_act & ~31u;
     for (int y = 0; y < H; y++) {
-        if (show)
+        if (show && d->core.format_act == Z2R_PIXEL_FORMAT_CLUT8)
+            // a byte per pixel through the palette (8:8:8 on the board), reduced to the frame's RGB565
+            for (int x = 0; x < W; x++) {
+                const uint32_t c = d->core.palette[d->core.vram[(base + y * stride + x) & (Z2rtgCore::VRAM_BYTES - 1)]];
+                const uint16_t p = static_cast<uint16_t>(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
+                d->line[2 * x] = static_cast<uae_u8>(p >> 8);
+                d->line[2 * x + 1] = static_cast<uae_u8>(p);
+            }
+        else if (show)
             for (size_t i = 0; i < line_size; i++)
                 d->line[i] = d->core.vram[(base + y * stride + i) & (Z2rtgCore::VRAM_BYTES - 1)];
         else
