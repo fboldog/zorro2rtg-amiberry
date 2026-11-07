@@ -32,7 +32,10 @@ static speed_t baud_const(int baud)
 
 bool Z2rtgLink::open(const char *device, int baud, FILE *lg)
 {
+    close();                                     // a port lost earlier: its thread and descriptor
     log = lg;
+    dev = device;
+    lost = false;
     fd = ::open(device, O_RDWR | O_NOCTTY);
     if (fd < 0) {
         if (log) fprintf(log, "z2rtg link: %s: %s\n", device, strerror(errno));
@@ -61,6 +64,7 @@ bool Z2rtgLink::open(const char *device, int baud, FILE *lg)
 
 void Z2rtgLink::close()
 {
+    const bool was_open = th.joinable() || fd >= 0;
     if (th.joinable()) {
         {
             std::lock_guard<std::mutex> g(mx);
@@ -73,15 +77,26 @@ void Z2rtgLink::close()
         ::close(fd);
         fd = -1;
     }
-    if (log)
+    if (log && was_open)
         fprintf(log, "z2rtg link: %llu words in %llu bursts, %llu blitter polls, %llu errors, %llu bursts resent, "
                 "queue up to %zu\n", (unsigned long long)words, (unsigned long long)bursts,
                 (unsigned long long)polls, (unsigned long long)errors, (unsigned long long)resent, queue_max);
 }
 
+void Z2rtgLink::port_lost(const char *what)
+{
+    if (lost.exchange(true))
+        return;
+    if (log) {
+        fprintf(log, "z2rtg link: lost %s (%s): no more writes reach the real board, which keeps its last "
+                "picture. A reset of the emulated Amiga opens the port again\n", dev.c_str(), what);
+        fflush(log);
+    }
+}
+
 void Z2rtgLink::write(uint32_t offset, uint16_t value)
 {
-    if (fd < 0)
+    if (!is_open())
         return;
     {
         std::lock_guard<std::mutex> g(mx);
@@ -93,7 +108,7 @@ void Z2rtgLink::write(uint32_t offset, uint16_t value)
 
 void Z2rtgLink::wait_blitter()
 {
-    if (fd < 0)
+    if (!is_open())
         return;
     {
         std::lock_guard<std::mutex> g(mx);
@@ -105,9 +120,12 @@ void Z2rtgLink::wait_blitter()
 bool Z2rtgLink::send(const uint8_t *p, size_t n)
 {
     while (n) {
+        if (lost)
+            return false;
         ssize_t k = ::write(fd, p, n);
         if (k < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
+            port_lost(strerror(errno));
             return false;
         }
         p += k;
@@ -124,10 +142,19 @@ int Z2rtgLink::recv(uint8_t *p, size_t n, int timeout_ms)
         int left = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                         end - std::chrono::steady_clock::now()).count());
         if (left <= 0) break;
+        if (lost) break;
         pollfd pf {fd, POLLIN, 0};
         if (poll(&pf, 1, left) <= 0) continue;
+        if (pf.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            port_lost("hang-up");
+            break;
+        }
         ssize_t k = ::read(fd, p + got, n - got);
         if (k > 0) got += static_cast<size_t>(k);
+        else if (k == 0 || (errno != EINTR && errno != EAGAIN)) {
+            port_lost(k == 0 ? "end of file" : strerror(errno));
+            break;
+        }
     }
     return static_cast<int>(got);
 }
@@ -138,6 +165,10 @@ bool Z2rtgLink::ack()
     if (recv(&r, 1, 2000) == 1 && r == 'k') {
         inflight.pop_front();
         return true;
+    }
+    if (lost) {
+        inflight.clear();
+        return false;
     }
     errors++;
     if (log)
@@ -159,7 +190,7 @@ bool Z2rtgLink::drain()
 // Wait that out, then send the refused burst and every one after it again, one at a time.
 bool Z2rtgLink::recover()
 {
-    for (int attempt = 0; attempt < 3; attempt++) {
+    for (int attempt = 0; attempt < 3 && !lost; attempt++) {
         usleep(30000);
         tcflush(fd, TCIFLUSH);
         bool ok = true;
@@ -178,6 +209,10 @@ bool Z2rtgLink::recover()
         if (ok)
             return true;
         errors++;
+    }
+    if (lost) {
+        inflight.clear();
+        return false;
     }
     if (log)
         fprintf(log, "z2rtg link: %zu bursts dropped after three attempts; the real board is out of step\n",
@@ -216,6 +251,8 @@ bool Z2rtgLink::blitter_idle()
     for (int n = 0; n < 2000; n++) {             // a 1280x720 copy takes about 13 ms
         uint8_t r[2];
         if (!send(cmd, 4) || recv(r, 2, 500) != 2) {
+            if (lost)
+                return false;
             errors++;
             if (log) fprintf(log, "z2rtg link: no answer to a STATUS read, retrying\n");
             usleep(30000);                       // a refused read: resynchronise and ask again
@@ -242,6 +279,11 @@ void Z2rtgLink::run()
                 break;
             work.assign(q.begin(), q.end());
             q.clear();
+        }
+        if (lost) {
+            work.clear();
+            inflight.clear();
+            continue;
         }
         std::map<uint32_t, uint16_t> seg;
         for (size_t i = 0; i < work.size();) {

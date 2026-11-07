@@ -71,7 +71,10 @@ for f in "$P/Amiberry/Configurations/Zorro2RTG Nano20K.uae" "$P/.config/amiberry
     sed "s|@PKG@|$P|g" "$f.in" > "$f"
 done
 if [ -z "$Z2RTG_BRIDGE" ]; then
-    Z2RTG_BRIDGE=$(ls /dev/ttyUSB* 2>/dev/null | tail -1)     # the Nano 20K's UART is its last ttyUSB
+    # the Nano 20K's UART: its by-id name (interface 1; 0 is JTAG) still points at it after the module drops
+    # off USB and comes back as another ttyUSB, so a reset of the emulated Amiga reconnects. Else the last ttyUSB
+    Z2RTG_BRIDGE=$(ls /dev/serial/by-id/*20K*FRIEND*-if01-port0 2>/dev/null | head -1)
+    [ -n "$Z2RTG_BRIDGE" ] || Z2RTG_BRIDGE=$(ls /dev/ttyUSB* 2>/dev/null | tail -1)
 fi
 if [ -n "$Z2RTG_BRIDGE" ] && [ "$Z2RTG_BRIDGE" != none ]; then
     export Z2RTG_BRIDGE
@@ -112,8 +115,11 @@ Built $(date +%F) from $(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/
      ./amiga.sh sh 'List SYS:'       any AmigaDOS commands, with their output and return code
      ./amiga.sh ipc SCREENSHOT /tmp/shot.png    Amiberry's IPC commands (./amiga.sh ipc HELP)
   The shell needs RexxMast and S:Z2Agent.rexx, started by S:User-Startup on the bundled drive.
-- The Nano 20K is found as the last /dev/ttyUSB*. Z2RTG_BRIDGE=/dev/ttyUSBn ./start.sh picks another port,
-  Z2RTG_BRIDGE=none ./start.sh runs without it. Link messages and statistics print in the terminal.
+- The Nano 20K is found by its /dev/serial/by-id name (else as the last /dev/ttyUSB*).
+  Z2RTG_BRIDGE=/dev/ttyUSBn ./start.sh picks another port, Z2RTG_BRIDGE=none ./start.sh runs without it.
+  Link messages and statistics print in the terminal.
+- If the module drops off USB, the link prints "z2rtg link: lost ..." and stops; the board keeps its last
+  picture. A reset of the emulated Amiga (./amiga.sh ipc RESET) opens the port again and redraws everything.
 - The link sends what the emulated Amiga writes, at about 290 KB/s, so the board can lag behind on large
   redraws; it catches up.
 - Reads are answered by the emulated board, never by the real one.
