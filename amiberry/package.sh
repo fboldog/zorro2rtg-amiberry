@@ -30,6 +30,19 @@ FS=$(cd "$(dirname "$0")/../../.." && pwd)/fpga/zorro2rtg/impl/pnr/zorro2rtg.fs
 cp "$KICK" "$P/Amiberry/ROMs/"
 cp -a "$DRIVE" "$P/Amiberry/HardDrives/DH0"
 rm -f "$P/Amiberry/HardDrives/DH0/Prefs/Env-Archive/Prism.booting"   # left by a stopped PrismRTG start
+# the remote shell (z2amiga.py): the agent and its presets on the drive, the tool next to start.sh
+python3 "$(dirname "$0")/z2amiga.py" --drive "$P/Amiberry/HardDrives/DH0" install >/dev/null
+rm -f "$P/Amiberry/HardDrives/DH0/Z2Agent/"*
+cp "$(dirname "$0")/z2amiga.py" "$P/z2amiga.py"
+cat > "$P/amiga.sh" <<'EOF2'
+#!/bin/sh
+# The running Amiga, without its window (z2amiga.py): ./amiga.sh mode 640x480, ./amiga.sh sh 'List RAM:',
+# ./amiga.sh ipc SCREENSHOT /tmp/s.png. Works over ssh too.
+P=$(cd "$(dirname "$0")" && pwd)
+RT=$(cat "$P/.runtime.path" 2>/dev/null || echo "$P/.runtime")      # written by start.sh
+exec python3 "$P/z2amiga.py" --drive "$P/Amiberry/HardDrives/DH0" --socket "$RT/amiberry.sock" "$@"
+EOF2
+chmod +x "$P/amiga.sh"
 cp -a "$ISO/Amiberry/Visuals" "$P/Amiberry/" 2>/dev/null || true
 # @PKG@ is replaced with the bundle's folder by start.sh, so the folder can live anywhere
 sed -e "s|^kickstart_rom_file=.*|kickstart_rom_file=@PKG@/Amiberry/ROMs/$(basename "$KICK")|" \
@@ -68,7 +81,10 @@ else
     echo "Zorro2RTG: no Nano 20K link, emulated board only"
 fi
 REAL_RT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-RT=$P/.runtime; mkdir -p "$RT"; chmod 700 "$RT"
+RT=$P/.runtime
+# Amiberry's IPC socket (amiberry.sock, used by amiga.sh) needs a path under 108 bytes
+[ ${#RT} -gt 90 ] && RT=$(mktemp -d /tmp/z2rtg.XXXXXX)
+mkdir -p "$RT"; chmod 700 "$RT"; echo "$RT" > "$P/.runtime.path"
 [ -n "$WAYLAND_DISPLAY" ] && [ "${WAYLAND_DISPLAY#/}" = "$WAYLAND_DISPLAY" ] && export WAYLAND_DISPLAY=$REAL_RT/$WAYLAND_DISPLAY
 [ -S "$REAL_RT/pulse/native" ] && export PULSE_SERVER=unix:$REAL_RT/pulse/native
 [ -S "$REAL_RT/pipewire-0" ] && export PIPEWIRE_REMOTE=$REAL_RT/pipewire-0
@@ -91,6 +107,11 @@ Built $(date +%F) from $(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/
 3. The Amiga boots on the emulator's own screen. When the RTG screen opens (Workbench at 1280x720x16),
    the same picture appears on the Nano 20K's HDMI output.
 
+- Without the window (headless, or over ssh), ./amiga.sh drives the running Amiga:
+     ./amiga.sh mode 640x480         Workbench in 640x480, 800x600, 1024x768 or 1280x720 (kept over a reboot)
+     ./amiga.sh sh 'List SYS:'       any AmigaDOS commands, with their output and return code
+     ./amiga.sh ipc SCREENSHOT /tmp/shot.png    Amiberry's IPC commands (./amiga.sh ipc HELP)
+  The shell needs RexxMast and S:Z2Agent.rexx, started by S:User-Startup on the bundled drive.
 - The Nano 20K is found as the last /dev/ttyUSB*. Z2RTG_BRIDGE=/dev/ttyUSBn ./start.sh picks another port,
   Z2RTG_BRIDGE=none ./start.sh runs without it. Link messages and statistics print in the terminal.
 - The link sends what the emulated Amiga writes, at about 290 KB/s, so the board can lag behind on large
