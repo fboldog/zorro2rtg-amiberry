@@ -8,7 +8,8 @@ Two channels:
 
     z2amiga.py [--drive DH0DIR] [--socket SOCK] install          agent, User-Startup lines, mode presets
     z2amiga.py sh 'List SYS:Prefs'                               run AmigaDOS commands, print the output
-    z2amiga.py mode 640x480 | 800x600 | 1024x768 | 1280x720      Workbench screen mode (used and saved)
+    z2amiga.py mode 640x480 | 800x600 | 1024x768 | 1280x720      Workbench screen mode, 16-bit (used and saved);
+                                                                 with x8 (640x480x8) 8-bit, CLUT8
     z2amiga.py ipc RESET HARD                                    one IPC command, tab-joined arguments
 
 Defaults: DH0 of "A2000 Zorro2RTG" in ~/amiberry-zorro2, or $Z2AMIGA_DRIVE; the socket in that instance's
@@ -27,8 +28,10 @@ ISO = pathlib.Path.home() / "amiberry-zorro2"
 DEF_DRIVE = ISO / "Amiberry/HardDrives/A2000-Zorro2RTG"
 DEF_SOCKET = ISO / ".runtime/amiberry.sock"
 
-# PrismRTG 16-bit mode IDs, the same for Zorro2RTG.card and the native driver (docs/driver.md)
-MODES = {"640x480": 0x7A000101, "800x600": 0x7A000102, "1024x768": 0x7A000103, "1280x720": 0x7A000104}
+# PrismRTG mode IDs, the same for Zorro2RTG.card and the native driver (docs/driver.md): $7A0001nn is
+# 16-bit, $7A0000nn 8-bit (CLUT8), nn the size as MODE_PRESET + 1
+SIZES = ("640x480", "800x600", "1024x768", "1280x720")
+MODES = {**{n: 0x7A000101 + i for i, n in enumerate(SIZES)}, **{n + "x8": 0x7A000001 + i for i, n in enumerate(SIZES)}}
 ID_OFFSET = 0x32                      # DisplayID in ScreenMode.prefs (FORM PREF, SCRM chunk)
 
 USER_STARTUP = """; Zorro2RTG remote shell (z2amiga.py install)
