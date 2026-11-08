@@ -8,7 +8,7 @@ Two channels:
 
     z2amiga.py [--drive DH0DIR] [--socket SOCK] install          agent, User-Startup lines, mode presets
     z2amiga.py sh 'List SYS:Prefs'                               run AmigaDOS commands, print the output
-    z2amiga.py mode 640x480 | 800x600 | 1024x768 | 1280x720      Workbench screen mode, 16-bit (used and saved);
+    z2amiga.py mode 640x480 | 800x600 | 1024x768 | 1280x720 | 848x480 | 1360x768 | 1280x800   Workbench mode, 16-bit;
                                                                  with x8 (640x480x8) 8-bit, CLUT8
     z2amiga.py ipc RESET HARD                                    one IPC command, tab-joined arguments
 
@@ -29,9 +29,11 @@ DEF_DRIVE = ISO / "Amiberry/HardDrives/A2000-Zorro2RTG"
 DEF_SOCKET = ISO / ".runtime/amiberry.sock"
 
 # PrismRTG mode IDs, the same for Zorro2RTG.card and the native driver (docs/driver.md): $7A0001nn is
-# 16-bit, $7A0000nn 8-bit (CLUT8), nn the size as MODE_PRESET + 1
-SIZES = ("640x480", "800x600", "1024x768", "1280x720")
-MODES = {**{n: 0x7A000101 + i for i, n in enumerate(SIZES)}, **{n + "x8": 0x7A000001 + i for i, n in enumerate(SIZES)}}
+# 16-bit, $7A0000nn 8-bit (CLUT8), nn PrismRTG's size slot (src/prefs.c): the fixed sizes, then CUSTOM1-4 in
+# slots 11-14, then the extra sizes (1280x800 is slot 15). 848x480 and 1360x768 need CUSTOM1=848x480 and
+# CUSTOM2=1360x768 in ENVARC:Prism.prefs, 1280x800 its MODE lines ON (docs/driver.md)
+SLOTS = {"640x480": 1, "800x600": 2, "1024x768": 3, "1280x720": 4, "848x480": 11, "1360x768": 12, "1280x800": 15}
+MODES = {**{n: 0x7A000100 + i for n, i in SLOTS.items()}, **{n + "x8": 0x7A000000 + i for n, i in SLOTS.items()}}
 ID_OFFSET = 0x32                      # DisplayID in ScreenMode.prefs (FORM PREF, SCRM chunk)
 
 USER_STARTUP = """; Zorro2RTG remote shell (z2amiga.py install)
