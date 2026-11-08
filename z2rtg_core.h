@@ -11,8 +11,8 @@
 struct Z2rtgCore {
     static constexpr uint32_t VRAM_BYTES = 8u << 20;
     static constexpr uint16_t K_ID = 0x5A32, K_VERSION = 0x0001;
-    static constexpr uint16_t K_CAPS = 0x01EB;          // as rtl/top/zorro2rtg_top.v (CLUT8, RGB565, CURSOR, blitter)
-    static constexpr uint16_t K_MODES = 0x000F;         // 640x480, 800x600, 1024x768, 1280x720, as the gateware
+    static constexpr uint16_t K_CAPS = 0x03EB;          // as rtl/top/zorro2rtg_top.v (CLUT8, RGB565, CURSOR, blitter, DISPLAY_PAD)
+    static constexpr uint16_t K_MODES = 0x00EF;         // presets 0-3 and 5-7 (848x480, 1360x768, 1280x800), as the gateware
     static constexpr int LINES_PER_FRAME = 260;       // Amiga lines (64 us) per 720p60 frame, about
     static constexpr int VBLANK_LINES = 10;           // 30 of 750 video lines
     static constexpr uint64_t LINE_NS = 64000;        // one Amiga line
@@ -28,6 +28,7 @@ struct Z2rtgCore {
     bool vblank_latch = false, blt_err = false, scan_pending = false;
     // active copies, loaded at vertical blank
     uint16_t ctrl_act = 0, mode_act = 0, format_act = 1, stride_act = 0x0A00;
+    uint16_t pad = 0, pad_act = 0;                       // DISPLAY.PAD: shadow and the copy taken at vblank
     uint32_t scan_base_act = 0;
     // cursor (shown over the scanout, as rtl/video/cursor.v) and palette (8:8:8, used by CLUT8 scanout)
     uint16_t cursor_x = 0, cursor_y = 0;
@@ -70,6 +71,9 @@ struct Z2rtgCore {
 
     // what the HDMI output shows: false means black (disabled, blanked, unsupported mode or format)
     bool showing() const;
+    // the preset on the wire for the active mode and PAD (rtl/video/video_mode.v pad_row); the emulated
+    // display shows the picture itself, without the borders
+    int out_preset() const;
     // the active mode's size (MODE_PRESET, rtl/video/video_mode.v); 1280x720 for an unsupported one
     int width() const;
     int height() const;

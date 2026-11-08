@@ -23,6 +23,7 @@ void Z2rtgCore::reset()
     ctrl = 0; mode = 0; format = 1; stride = 0x0A00; bank = 0; frame_count = 0; scratch = 0;
     scan_base = 0; scan_base_hi_st = 0; vblank_latch = blt_err = scan_pending = false;
     ctrl_act = 0; mode_act = 0; format_act = 1; stride_act = 0x0A00; scan_base_act = 0;
+    pad = 0; pad_act = 0;
     cursor_x = cursor_y = 0;
     cursor_en_act = false; cursor_x_act = cursor_y_act = 0;
     for (int i = 0; i < 3; i++) cursor_col_act[i] = 0;
@@ -101,6 +102,9 @@ uint16_t Z2rtgCore::read_reg(uint32_t o)
     case Z2R_REG_FRAME_COUNT:  return frame_count;
     case Z2R_REG_SCRATCH:      return scratch;
     case Z2R_REG_MODES:        return K_MODES;
+    case Z2R_REG_DISPLAY:
+        return static_cast<uint16_t>(pad | (out_preset() << Z2R_DISPLAY_OUT_PRESET_SHIFT) |
+                                     (out_preset() != mode_act ? Z2R_DISPLAY_PADDED : 0));
     case Z2R_REG_CURSOR_X:     return cursor_x;
     case Z2R_REG_CURSOR_Y:     return cursor_y;
     case Z2R_REG_CURSOR_COL1_HI: return static_cast<uint16_t>(cursor_col[0] >> 16);
@@ -151,6 +155,7 @@ void Z2rtgCore::write_reg(uint32_t o, uint16_t v, unsigned be)
         }
         break;
     case Z2R_REG_MODE:   mode = bw(mode, v, be) & Z2R_MODE_PRESET_MASK; break;
+    case Z2R_REG_DISPLAY: pad = bw(pad, v, be) & Z2R_DISPLAY_PAD_MASK; break;   // OUT_PRESET, PADDED read-only
     case Z2R_REG_FORMAT: format = bw(format, v, be) & 0x3; break;
     case Z2R_REG_SCAN_BASE_HI: scan_base_hi_st = bw(scan_base_hi_st, v, be); break;
     case Z2R_REG_SCAN_BASE_LO:
@@ -217,7 +222,7 @@ bool Z2rtgCore::hsync()
 
 void Z2rtgCore::vblank_start()
 {
-    ctrl_act = ctrl; mode_act = mode; format_act = format; stride_act = stride;
+    ctrl_act = ctrl; mode_act = mode; format_act = format; stride_act = stride; pad_act = pad;
     scan_base_act = scan_base;
     cursor_en_act = (ctrl & Z2R_CTRL_CURSOR_EN) != 0;
     cursor_x_act = static_cast<int16_t>(cursor_x);
@@ -249,9 +254,21 @@ bool Z2rtgCore::showing() const
            (format_act == Z2R_PIXEL_FORMAT_RGB565 || format_act == Z2R_PIXEL_FORMAT_CLUT8);
 }
 
-static const int mode_w[4] = {640, 800, 1024, 1280}, mode_h[4] = {480, 600, 768, 720};
-int Z2rtgCore::width() const { return mode_act < 4 ? mode_w[mode_act] : 1280; }
-int Z2rtgCore::height() const { return mode_act < 4 ? mode_h[mode_act] : 720; }
+// MODE_PRESET sizes; 4 (1280x1024) is not supported and shows as 1280x720 here
+static const int mode_w[8] = {640, 800, 1024, 1280, 1280, 848, 1360, 1280};
+static const int mode_h[8] = {480, 600, 768, 720, 720, 480, 768, 800};
+int Z2rtgCore::width() const { return mode_act < 8 ? mode_w[mode_act] : 1280; }
+int Z2rtgCore::height() const { return mode_act < 8 ? mode_h[mode_act] : 720; }
+
+int Z2rtgCore::out_preset() const
+{
+    int out = mode_act;
+    if (pad_act == Z2R_PAD_ASPECT_R16X9 && mode_act <= 2)
+        out = mode_act == 0 ? Z2R_MODE_PRESET_M848X480 : mode_act == 1 ? Z2R_MODE_PRESET_M1280X720 : Z2R_MODE_PRESET_M1360X768;
+    else if (pad_act == Z2R_PAD_ASPECT_R16X10 && mode_act <= 3)
+        out = Z2R_MODE_PRESET_M1280X800;
+    return ((K_MODES >> out) & 1) ? out : mode_act;
+}
 
 // ------------------------------------------------------------------ blitter (as sim/blitter/tb_blitter.v)
 static uint8_t rop8(unsigned rop, uint8_t s, uint8_t d)

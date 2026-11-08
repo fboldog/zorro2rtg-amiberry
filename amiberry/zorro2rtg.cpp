@@ -3,7 +3,8 @@
  *
  * Glue between Amiberry's gfxboard_func interface and the emulator-independent board model in
  * z2rtg_core.cpp, which implements docs/registers.md of the Zorro2-Tang25k project: register file,
- * 8 MB VRAM window, scanout (640x480 to 1280x720 in RGB565 and CLUT8, as the gateware) and the blitter.
+ * 8 MB VRAM window, scanout (640x480 to 1360x768 in RGB565 and CLUT8, as the gateware; DISPLAY padding is
+ * reported but the borders are not drawn) and the blitter.
  * The register area (the first 64 KB) is an I/O bank through the model; the VRAM and staging window
  * above it is a RAM bank on the model's VRAM (with BANK), as the ZZ9000 model maps its VRAM.
  * The model's time (its 64 us lines: blitter busy time, vertical blank, FRAME_COUNT) follows the emulated
