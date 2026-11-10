@@ -150,8 +150,9 @@ def main():
         if len(a.args) != 1 or a.args[0] not in MODES:
             sys.exit("z2amiga: mode " + " | ".join(MODES))
         f = f"SYS:Prefs/Presets/Z2RTG-{a.args[0]}.prefs"
-        # ENV: is what IPrefs watches (it reopens Workbench), ENVARC: keeps it over a reboot
-        out, rc = sh(a, f"Copy {f} ENVARC:Sys/ScreenMode.prefs\nCopy {f} ENV:Sys/ScreenMode.prefs\n")
+        # ENV: is what IPrefs watches (it reopens Workbench), ENVARC: keeps it over a reboot; BUF=0 because
+        # Copy keeps its 64 KB default buffer allocated after a run from a script (Z2Agent.rexx)
+        out, rc = sh(a, f"Copy {f} ENVARC:Sys/ScreenMode.prefs BUF=0\nCopy {f} ENV:Sys/ScreenMode.prefs BUF=0\n")
         sys.stdout.write(out)
         if rc:
             sys.exit(f"z2amiga: rc {rc}")
