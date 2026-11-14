@@ -137,6 +137,7 @@ uint16_t Z2rtgCore::read_reg(uint32_t o)
     case Z2R_REG_CAPS:         return K_CAPS;
     case Z2R_REG_CTRL:         return ctrl;
     case Z2R_REG_STATUS:
+        // SCAN_UNDERRUN and SCAN_LINES stay 0: the emulated board has no scanout that can fall behind
         return static_cast<uint16_t>((vblank_latch ? Z2R_STATUS_VBLANK : 0) |
                                      (in_vblank() ? Z2R_STATUS_IN_VBLANK : 0) |
                                      (blt_busy() ? Z2R_STATUS_BLT_BUSY : 0) |
