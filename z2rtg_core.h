@@ -5,13 +5,15 @@
 #ifndef Z2RTG_CORE_H
 #define Z2RTG_CORE_H
 
+#include <array>
 #include <cstdint>
+#include <deque>
 #include <vector>
 
 struct Z2rtgCore {
     static constexpr uint32_t VRAM_BYTES = 8u << 20;
     static constexpr uint16_t K_ID = 0x5A32, K_VERSION = 0x0001;
-    static constexpr uint16_t K_CAPS = 0x03EB;          // as rtl/top/zorro2rtg_top.v (CLUT8, RGB565, CURSOR, blitter, DISPLAY_PAD)
+    static constexpr uint16_t K_CAPS = 0x07EB;          // as rtl/top/zorro2rtg_top.v (CLUT8, RGB565, CURSOR, blitter, DISPLAY_PAD, USB_INPUT)
     static constexpr uint16_t K_MODES = 0x00EF;         // presets 0-3 and 5-7 (848x480, 1360x768, 1280x800), as the gateware
     static constexpr int LINES_PER_FRAME = 260;       // Amiga lines (64 us) per 720p60 frame, about
     static constexpr int VBLANK_LINES = 10;           // 30 of 750 video lines
@@ -52,6 +54,20 @@ struct Z2rtgCore {
 
     int line = 0;                                     // position within the emulated video frame
 
+    // USB input queue (docs/registers.md section 6a, rtl/input/usb_input.v): events of TYPE and P0-P5
+    static constexpr size_t IN_DEPTH = 16;
+    std::deque<std::array<uint8_t, 7>> in_q;
+    bool in_ovf = false, in_ferr = false, in_irq_en = false;
+    // boot ROM (docs/registers.md section 7, BOOTROM): the image sw/bootrom/build.sh makes; empty reads 0
+    std::vector<uint8_t> rom;
+
+    // one byte of the single-wire link (frame 0xA5, TYPE, P0-P5, CRC-8), parsed as the gateware does
+    void in_link_byte(uint8_t b);
+    // a whole event (TYPE, P0-P5) into the queue, as a good frame does
+    void in_event(const std::array<uint8_t, 7> &ev);
+    // the card's /INT2 request: VBLANK with VBL_IRQ_EN, or an event with IN_CTRL.IRQ_EN
+    bool int_req() const;
+
     Z2rtgCore();
     void reset();
 
@@ -88,6 +104,8 @@ private:
     uint16_t read_reg(uint32_t offset);
     void write_reg(uint32_t offset, uint16_t value, unsigned be);
     void vblank_start();
+    uint8_t in_frame[9] = {};
+    int in_n = 0;
 };
 
 #endif

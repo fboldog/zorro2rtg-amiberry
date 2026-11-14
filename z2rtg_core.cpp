@@ -33,6 +33,52 @@ void Z2rtgCore::reset()
     dst_hi_st = src_hi_st = fg_hi_st = bg_hi_st = 0;
     blt_busy_until = 0;
     line = 0;
+    in_irq_en = false;                                // the queue itself keeps its events, as the gateware does
+}
+
+// ------------------------------------------------------------------ USB input
+static uint8_t crc8(const uint8_t *p, int n)          // polynomial 0x07, initial 0 (docs/usb_input.md)
+{
+    uint8_t c = 0;
+    while (n--) {
+        c ^= *p++;
+        for (int i = 0; i < 8; i++)
+            c = static_cast<uint8_t>(c & 0x80 ? (c << 1) ^ 0x07 : c << 1);
+    }
+    return c;
+}
+
+void Z2rtgCore::in_event(const std::array<uint8_t, 7> &ev)
+{
+    if (in_q.size() >= IN_DEPTH) {
+        in_ovf = true;
+        return;
+    }
+    in_q.push_back(ev);
+}
+
+void Z2rtgCore::in_link_byte(uint8_t b)
+{
+    if (in_n == 0 && b != 0xA5) {                     // a stray byte between frames
+        in_ferr = true;
+        return;
+    }
+    in_frame[in_n++] = b;
+    if (in_n < 9)
+        return;
+    in_n = 0;
+    if (crc8(in_frame + 1, 7) != in_frame[8]) {
+        in_ferr = true;
+        return;
+    }
+    std::array<uint8_t, 7> ev;
+    std::memcpy(ev.data(), in_frame + 1, 7);
+    in_event(ev);
+}
+
+bool Z2rtgCore::int_req() const
+{
+    return (vblank_latch && (ctrl & Z2R_CTRL_VBL_IRQ_EN)) || (!in_q.empty() && in_irq_en);
 }
 
 // ------------------------------------------------------------------ board window
@@ -81,6 +127,10 @@ uint16_t Z2rtgCore::read_reg(uint32_t o)
         uint32_t i = o - Z2R_CURSOR_IMG_START;
         return static_cast<uint16_t>((cursor_img[i] << 8) | cursor_img[i + 1]);
     }
+    if (o >= Z2R_BOOTROM_START && o < Z2R_BOOTROM_START + Z2R_BOOTROM_SIZE) {
+        uint32_t i = o - Z2R_BOOTROM_START;
+        return i + 1 < rom.size() ? static_cast<uint16_t>((rom[i] << 8) | rom[i + 1]) : 0;
+    }
     switch (o) {
     case Z2R_REG_ID:           return K_ID;
     case Z2R_REG_VERSION:      return K_VERSION;
@@ -102,6 +152,18 @@ uint16_t Z2rtgCore::read_reg(uint32_t o)
     case Z2R_REG_FRAME_COUNT:  return frame_count;
     case Z2R_REG_SCRATCH:      return scratch;
     case Z2R_REG_MODES:        return K_MODES;
+    case Z2R_REG_IN_STATUS:
+        return static_cast<uint16_t>((in_q.empty() ? 0 : Z2R_IN_STATUS_AVAIL) | (in_ovf ? Z2R_IN_STATUS_OVERFLOW : 0) |
+                                     (in_ferr ? Z2R_IN_STATUS_FRAME_ERR : 0) |
+                                     (in_q.size() << Z2R_IN_STATUS_LEVEL_SHIFT));
+    case Z2R_REG_IN_CTRL:      return in_irq_en ? Z2R_IN_CTRL_IRQ_EN : 0;
+    case Z2R_REG_IN_EV0: case Z2R_REG_IN_EV1: case Z2R_REG_IN_EV2: case Z2R_REG_IN_EV3: {
+        if (in_q.empty())
+            return 0;
+        const auto &e = in_q.front();
+        int i = (o - Z2R_REG_IN_EV0) / 2;             // EV0 = TYPE:P0, EV1 = P1:P2, EV2 = P3:P4, EV3 = P5:0
+        return static_cast<uint16_t>((e[2 * i] << 8) | (2 * i + 1 < 7 ? e[2 * i + 1] : 0));
+    }
     case Z2R_REG_DISPLAY:
         return static_cast<uint16_t>(pad | (out_preset() << Z2R_DISPLAY_OUT_PRESET_SHIFT) |
                                      (out_preset() != mode_act ? Z2R_DISPLAY_PADDED : 0));
@@ -154,6 +216,14 @@ void Z2rtgCore::write_reg(uint32_t o, uint16_t v, unsigned be)
             if (v & Z2R_STATUS_BLT_ERR) blt_err = false;
         }
         break;
+    case Z2R_REG_IN_STATUS:                                      // W1C, low byte lane
+        if (be & 1) {
+            if (v & Z2R_IN_STATUS_OVERFLOW)  in_ovf = false;
+            if (v & Z2R_IN_STATUS_FRAME_ERR) in_ferr = false;
+        }
+        break;
+    case Z2R_REG_IN_CTRL: if (be & 1) in_irq_en = v & Z2R_IN_CTRL_IRQ_EN; break;
+    case Z2R_REG_IN_POP:  if (!in_q.empty()) in_q.pop_front(); break;   // any write
     case Z2R_REG_MODE:   mode = bw(mode, v, be) & Z2R_MODE_PRESET_MASK; break;
     case Z2R_REG_DISPLAY: pad = bw(pad, v, be) & Z2R_DISPLAY_PAD_MASK; break;   // OUT_PRESET, PADDED read-only
     case Z2R_REG_FORMAT: format = bw(format, v, be) & 0x3; break;

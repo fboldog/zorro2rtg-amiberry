@@ -27,6 +27,9 @@ cp "$BIN" "$P/amiberry"
 # the bitstream of the current build, if there is one (fpga/zorro2rtg/build.sh)
 FS=$(cd "$(dirname "$0")/../../.." && pwd)/fpga/zorro2rtg/impl/pnr/zorro2rtg.fs
 [ -f "$FS" ] && cp "$FS" "$P/zorro2rtg.fs" || echo "package.sh: no bitstream in fpga/zorro2rtg/impl, none bundled" >&2
+# the card's boot ROM (sw/bootrom/build.sh): the USB input driver, started by the emulated Amiga at boot
+ROMIMG=$(cd "$(dirname "$0")/../../.." && pwd)/sw/bootrom/build/bootrom.bin
+[ -f "$ROMIMG" ] && cp "$ROMIMG" "$P/bootrom.bin" || echo "package.sh: no sw/bootrom/build/bootrom.bin, no boot ROM bundled" >&2
 cp "$KICK" "$P/Amiberry/ROMs/"
 cp -a "$DRIVE" "$P/Amiberry/HardDrives/DH0"
 rm -f "$P/Amiberry/HardDrives/DH0/Prefs/Env-Archive/Prism.booting"   # left by a stopped PrismRTG start
@@ -79,10 +82,14 @@ fi
 if [ -n "$Z2RTG_BRIDGE" ] && [ "$Z2RTG_BRIDGE" != none ]; then
     export Z2RTG_BRIDGE
     echo "Zorro2RTG: mirroring to the Nano 20K on $Z2RTG_BRIDGE (link messages appear here)"
+    # keyboard and mouse on the board's RP2040 (pin 51) reach the emulated Amiga through the card
+    export Z2RTG_INPUT=${Z2RTG_INPUT:-bridge}
 else
     unset Z2RTG_BRIDGE
     echo "Zorro2RTG: no Nano 20K link, emulated board only"
 fi
+[ -f "$P/bootrom.bin" ] && export Z2RTG_BOOTROM=${Z2RTG_BOOTROM:-$P/bootrom.bin}
+[ "$Z2RTG_INPUT" = none ] && unset Z2RTG_INPUT
 REAL_RT=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 RT=$P/.runtime
 # Amiberry's IPC socket (amiberry.sock, used by amiga.sh) needs a path under 108 bytes
@@ -122,7 +129,11 @@ Built $(date +%F) from $(git -C "$(dirname "$0")" rev-parse --short HEAD 2>/dev/
   picture. A reset of the emulated Amiga (./amiga.sh ipc RESET) opens the port again and redraws everything.
 - The link sends what the emulated Amiga writes, at about 290 KB/s, so the board can lag behind on large
   redraws; it catches up.
-- Reads are answered by the emulated board, never by the real one.
+- Reads are answered by the emulated board, never by the real one. The exception is the USB input:
+  a keyboard and mouse on the RP2040 wired to the board's pin 51 (docs/usb_input.md) drive the emulated
+  Amiga. The link polls the real card's event queue about every 5 ms and the card's boot ROM driver
+  (bootrom.bin) feeds the events to input.device. Ctrl+LAmiga+RAmiga reboots the emulated Amiga.
+  Z2RTG_INPUT=none ./start.sh turns it off. Amiberry's own keyboard and mouse keep working too.
 - Needs the system Amiberry package (its data files in /usr/share/amiberry).
 - The Kickstart ROM and the DH0 contents are AmigaOS 3.1.4 files: personal use only, do not share.
 EOF

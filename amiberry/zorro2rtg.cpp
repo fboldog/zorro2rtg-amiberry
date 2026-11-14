@@ -10,6 +10,11 @@
  * The model's time (its 64 us lines: blitter busy time, vertical blank, FRAME_COUNT) follows the emulated
  * CPU clock, read at every board access and on each hsync callback. The hsync callback alone is not enough:
  * Amiberry stops calling it after the boot-time reset.
+ * USB input and boot ROM (docs/usb_input.md): Z2RTG_BOOTROM=FILE loads the boot ROM image into the BOOTROM window
+ * (default: none, the window reads 0 and the DiagArea is ignored); Z2RTG_INPUT=FIFO reads single-wire link frames
+ * from a named pipe (sw/tools/host/z2sendkeys.py writes them); Z2RTG_INPUT=bridge, with Z2RTG_BRIDGE, takes the
+ * events from the real board's queue instead (a keyboard and mouse on its RP2040). A 1 ms event polls the pipe and raises INT2 while
+ * the card requests it, since the line is level-triggered and the hsync callback stops after reset.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -24,10 +29,14 @@
 #include "xwin.h"
 #include "events.h"
 #include "newcpu.h"
+#include "devices.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <vector>
 
@@ -58,15 +67,43 @@ struct z2rtg_state {
     FILE *tf = nullptr;          // Z2RTG_TRACE_FILE: trace written here, flushed per line
     Z2rtgLink link;              // Z2RTG_BRIDGE=/dev/ttyUSBn: mirror every write to a real Nano 20K
     evt_t last_cycles = 0;
+    int in_fd = -1;              // Z2RTG_INPUT: the link frames' named pipe
 };
 
 static void z2_follow_video_en(z2rtg_state *d);
+static z2rtg_state *z2rtg_boards[MAX_RTG_BOARDS];
+
+// every 1 ms of emulated time: link bytes from Z2RTG_INPUT into the model, and INT2 while the card requests it
+static constexpr evt_t TICK = 3547;   // colour clocks, PAL
+static void z2_tick(uae_u32 devnum)
+{
+    z2rtg_state *d = devnum < MAX_RTG_BOARDS ? z2rtg_boards[devnum] : nullptr;
+    if (!d || !d->configured)
+        return;
+    if (d->in_fd >= 0) {
+        uint8_t buf[256];
+        ssize_t n = read(d->in_fd, buf, sizeof buf);
+        for (ssize_t i = 0; i < n; i++)
+            d->core.in_link_byte(buf[i]);
+    }
+    for (std::array<uint8_t, 7> ev; d->link.take_event(ev);)      // Z2RTG_INPUT=bridge
+        d->core.in_event(ev);
+    if (d->core.int_req())
+        safe_interrupt_set(IRQ_SOURCE_GFX, d->monitor_id, false);
+    event2_newevent_xx(-1, TICK * CYCLE_UNIT, devnum, z2_tick);
+}
+static void z2_tick_start(z2rtg_state *d)
+{
+    if (!event2_newevent_x_exists(z2_tick))
+        event2_newevent_xx(-1, TICK * CYCLE_UNIT, static_cast<uae_u32>(d->devnum), z2_tick);
+}
 
 // advance the model to the emulated CPU time, one 64 us line (227 colour clocks) at a time
 static void z2_advance(z2rtg_state *d)
 {
     const evt_t line = static_cast<evt_t>(227) * CYCLE_UNIT;
     const evt_t now = get_cycles();
+    z2_tick_start(d);
     if (now < d->last_cycles || now - d->last_cycles > line * 100000) {
         d->last_cycles = now;              // first call, or a jump (reset, state load): resync
         d->core.blt_busy_until = 0;
@@ -135,7 +172,6 @@ static void z2_trace(z2rtg_state *d, uae_u32 off, uae_u32 v, int size)
     }
 }
 
-static z2rtg_state *z2rtg_boards[MAX_RTG_BOARDS];
 
 // Zorro II bus time per word access, in colour clocks (281.9 ns): a cycle is 4 clocks of 7.09 MHz,
 // 2 colour clocks. Writes go into the card's posted-write FIFO, reads hold XRDY until the data is back.
@@ -425,6 +461,13 @@ static void z2rtg_configured(void *userdata, uae_u32 address)
     // registers stay in the I/O bank mapped by gfxboard.cpp; VRAM and staging become memory
     map_banks(&z2rtg_vram_bank, (address + 0x10000) >> 16, (Z2RTG_SIZE - 0x10000) >> 16, 0);
     write_log(_T("Zorro2RTG configured at %08x\n"), address);
+    const char *in_src = getenv("Z2RTG_INPUT");
+    const bool in_bridge = in_src && !strcmp(in_src, "bridge");
+    if (const char *f = in_src; f && !in_bridge && d->in_fd < 0) {
+        d->in_fd = open(f, O_RDONLY | O_NONBLOCK);
+        write_log(_T("Zorro2RTG: USB input from %s%s\n"), f, d->in_fd < 0 ? " failed to open" : "");
+    }
+    z2_tick_start(d);
     if (const char *dev = getenv("Z2RTG_BRIDGE")) {
         const char *b = getenv("Z2RTG_BRIDGE_BAUD");
         if (d->link.is_open() || d->link.open(dev, b ? atoi(b) : 3000000, d->tf ? d->tf : stderr)) {
@@ -432,6 +475,11 @@ static void z2rtg_configured(void *userdata, uae_u32 address)
             d->link.write(Z2R_REG_CTRL, 0);
             d->link.write(Z2R_REG_BANK, 0);
             d->link.write(Z2R_REG_STATUS, Z2R_STATUS_VBLANK | Z2R_STATUS_BLT_ERR);
+            if (in_bridge) {
+                // keyboard and mouse on the real board's USB input (an RP2040 on pin 51) drive the emulated one
+                d->link.enable_input();
+                write_log(_T("Zorro2RTG: USB input from the real board over the bridge\n"));
+            }
         }
     }
 }
@@ -459,6 +507,8 @@ static void z2rtg_free(void *userdata)
     if (d->devnum >= 0 && d->devnum < MAX_RTG_BOARDS)
         z2rtg_boards[d->devnum] = nullptr;
     d->link.close();
+    if (d->in_fd >= 0)
+        close(d->in_fd);
     delete d;
 }
 
@@ -482,6 +532,16 @@ static bool z2rtg_init(autoconfig_info *aci)
         d->trace_blt = atoi(t);
     if (const char *f = getenv("Z2RTG_TRACE_FILE"))
         d->tf = fopen(f, "w");
+    if (const char *f = getenv("Z2RTG_BOOTROM")) {
+        if (FILE *rf = fopen(f, "rb")) {
+            d->core.rom.resize(Z2R_BOOTROM_SIZE);
+            d->core.rom.resize(fread(d->core.rom.data(), 1, Z2R_BOOTROM_SIZE, rf));
+            fclose(rf);
+            write_log(_T("Zorro2RTG: boot ROM %s, %u bytes\n"), f, static_cast<unsigned>(d->core.rom.size()));
+        } else {
+            write_log(_T("Zorro2RTG: boot ROM %s not found\n"), f);
+        }
+    }
     z2rtg_boards[d->devnum] = d;
     aci->addrbank = &z2rtg_bank;
     aci->userdata = d;

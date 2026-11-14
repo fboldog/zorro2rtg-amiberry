@@ -7,6 +7,10 @@
 //     before it sends anything after it. The emulated CPU waits on the model's BLT_BUSY, which the real
 //     board never sees, so a long job would otherwise still be running when the next writes arrive.
 //   - Reads are never forwarded: the model answers them.
+//   - enable_input(): the real board's USB input queue (IN_*, docs/usb_input.md) becomes the source of the
+//     model's events. Between bursts, about every 5 ms, the link reads IN_STATUS and IN_EV0-3 and pops each
+//     event on the real board; take_event() hands them to the emulator. Writes to IN_* are then not
+//     forwarded, so the emulated driver's IN_POP never pops a real event.
 //   - A burst the bridge refuses ('e', for example after a pause on the USB side) is sent again, with
 //     every burst after it, once the bridge has resynchronised. Word writes can be repeated safely; a
 //     repeated BLT_OP would run its job twice, which is logged.
@@ -24,6 +28,7 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <array>
 #include <thread>
 #include <string>
 #include <vector>
@@ -36,10 +41,12 @@ public:
     bool is_open() const { return fd >= 0 && !lost; }
     void write(uint32_t offset, uint16_t value);       // a word at a board offset (even)
     void wait_blitter();                               // the real BLT_BUSY must clear before what follows
+    void enable_input() { input = true; }              // poll the real board's USB input queue
+    bool take_event(std::array<uint8_t, 7> &ev);       // the next event read from it, if any
     void close();
 
     // statistics (read without the lock: approximate)
-    uint64_t words = 0, bursts = 0, polls = 0, errors = 0, resent = 0;
+    uint64_t words = 0, bursts = 0, polls = 0, errors = 0, resent = 0, events = 0;
     size_t queue_max = 0;
 
 private:
@@ -53,6 +60,8 @@ private:
     std::condition_variable cv;
     std::deque<Item> q;
     bool stop = false;
+    std::atomic<bool> input {false};
+    std::deque<std::array<uint8_t, 7>> evq;      // events from the real board, under mx
     std::deque<std::vector<uint8_t>> inflight;   // bursts sent and not yet acknowledged, oldest first
 
     void run();
@@ -64,6 +73,7 @@ private:
     bool recover();
     bool burst(uint32_t off, const uint16_t *w, unsigned n);
     bool blitter_idle();
+    void poll_input();
 };
 
 #endif
