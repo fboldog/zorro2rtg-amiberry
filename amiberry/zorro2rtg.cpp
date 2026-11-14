@@ -8,13 +8,15 @@
  * The register area (the first 64 KB) is an I/O bank through the model; the VRAM and staging window
  * above it is a RAM bank on the model's VRAM (with BANK), as the ZZ9000 model maps its VRAM.
  * The model's time (its 64 us lines: blitter busy time, vertical blank, FRAME_COUNT) follows the emulated
- * CPU clock, read at every board access and on each hsync callback. The hsync callback alone is not enough:
- * Amiberry stops calling it after the boot-time reset.
+ * CPU clock, read at every board access and on each hsync callback, so BLT_BUSY resolves to the CPU cycle
+ * inside a line. (An earlier note here said Amiberry stops calling the hsync callback after the boot-time
+ * reset. Instrumented on v8.5.0 on 2026-11-14, it runs every line after the boot reset and after a reboot
+ * of the running machine, so the note was wrong.)
  * USB input and boot ROM (docs/usb_input.md): Z2RTG_BOOTROM=FILE loads the boot ROM image into the BOOTROM window
  * (default: none, the window reads 0 and the DiagArea is ignored); Z2RTG_INPUT=FIFO reads single-wire link frames
  * from a named pipe (sw/tools/host/z2sendkeys.py writes them); Z2RTG_INPUT=bridge, with Z2RTG_BRIDGE, takes the
  * events from the real board's queue instead (a keyboard and mouse on its RP2040). A 1 ms event polls the pipe and raises INT2 while
- * the card requests it, since the line is level-triggered and the hsync callback stops after reset.
+ * the card requests it, since the line is level-triggered.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
