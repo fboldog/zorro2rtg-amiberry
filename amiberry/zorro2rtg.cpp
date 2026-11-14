@@ -86,7 +86,10 @@ static void z2_tick(uae_u32 devnum)
         for (ssize_t i = 0; i < n; i++)
             d->core.in_link_byte(buf[i]);
     }
-    for (std::array<uint8_t, 7> ev; d->link.take_event(ev);)      // Z2RTG_INPUT=bridge
+    // Z2RTG_INPUT=bridge: only as many as the emulated queue has room for; the rest wait in the link, so an
+    // emulated Amiga that is busy (a long redraw) delays events instead of losing them
+    std::array<uint8_t, 7> ev;
+    while (d->core.in_q.size() < Z2rtgCore::IN_DEPTH && d->link.take_event(ev))
         d->core.in_event(ev);
     if (d->core.int_req())
         safe_interrupt_set(IRQ_SOURCE_GFX, d->monitor_id, false);

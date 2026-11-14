@@ -8,7 +8,7 @@
 //     board never sees, so a long job would otherwise still be running when the next writes arrive.
 //   - Reads are never forwarded: the model answers them.
 //   - enable_input(): the real board's USB input queue (IN_*, docs/usb_input.md) becomes the source of the
-//     model's events. Between bursts, about every 5 ms, the link reads IN_STATUS and IN_EV0-3 and pops each
+//     model's events. About every 5 ms, also between the bursts of a long redraw, the link reads IN_STATUS and IN_EV0-3 and pops each
 //     event on the real board; take_event() hands them to the emulator. Writes to IN_* are then not
 //     forwarded, so the emulated driver's IN_POP never pops a real event.
 //   - A burst the bridge refuses ('e', for example after a pause on the USB side) is sent again, with
@@ -23,6 +23,7 @@
 #define Z2RTG_LINK_H
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -46,7 +47,7 @@ public:
     void close();
 
     // statistics (read without the lock: approximate)
-    uint64_t words = 0, bursts = 0, polls = 0, errors = 0, resent = 0, events = 0;
+    uint64_t words = 0, bursts = 0, polls = 0, errors = 0, resent = 0, events = 0, in_overflows = 0, in_frame_errs = 0;
     size_t queue_max = 0;
 
 private:
@@ -74,6 +75,8 @@ private:
     bool burst(uint32_t off, const uint16_t *w, unsigned n);
     bool blitter_idle();
     void poll_input();
+    void maybe_poll_input();                     // poll_input() if 5 ms have passed since the last
+    std::chrono::steady_clock::time_point next_input {};
 };
 
 #endif

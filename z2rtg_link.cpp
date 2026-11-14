@@ -79,9 +79,9 @@ void Z2rtgLink::close()
     }
     if (log && was_open)
         fprintf(log, "z2rtg link: %llu words in %llu bursts, %llu blitter polls, %llu errors, %llu bursts resent, "
-                "queue up to %zu, %llu input events\n", (unsigned long long)words, (unsigned long long)bursts,
+                "queue up to %zu, %llu input events, %llu input overflows\n", (unsigned long long)words, (unsigned long long)bursts,
                 (unsigned long long)polls, (unsigned long long)errors, (unsigned long long)resent, queue_max,
-                (unsigned long long)events);
+                (unsigned long long)events, (unsigned long long)in_overflows);
 }
 
 void Z2rtgLink::port_lost(const char *what)
@@ -280,15 +280,23 @@ bool Z2rtgLink::take_event(std::array<uint8_t, 7> &ev)
     return true;
 }
 
-// IN_STATUS .. IN_EV3 in one burst read; each event found is popped on the real board (IN_POP)
+// IN_STATUS .. IN_EV3 in one burst read. An event found is popped on the real board (IN_POP) in the same
+// send as the next read, so each event costs one USB round trip. The pop is only ever sent for an event
+// already read: a pop sent ahead of its read could drop an event that arrived in between.
 void Z2rtgLink::poll_input()
 {
     if (!drain())
         return;
-    for (int n = 0; n < 16 && !lost; n++) {
-        const uint8_t cmd[5] = {'S', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_STATUS), 5};
-        uint8_t r[12];
-        if (!send(cmd, 5) || recv(r, 12, 500) != 12) {
+    static const uint8_t rd[5] = {'S', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_STATUS), 5};
+    static const uint8_t pop_rd[11] = {'W', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_POP), 0, Z2R_IN_POP_POP,
+                                       'S', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_STATUS), 5};
+    uint8_t r[13];
+    bool popped = false;                         // the last send was pop + read: 'k' comes first
+    if (!send(rd, sizeof rd))
+        return;
+    for (int n = 0; n < 32 && !lost; n++) {
+        const size_t want = popped ? 13 : 12;
+        if (recv(r, want, 500) != static_cast<int>(want) || (popped && r[0] != 'k')) {
             if (!lost) {
                 errors++;
                 if (log) fprintf(log, "z2rtg link: no answer to an IN_STATUS read\n");
@@ -297,11 +305,14 @@ void Z2rtgLink::poll_input()
             }
             return;
         }
-        const uint16_t st = static_cast<uint16_t>(r[0] << 8 | r[1]);
-        if (st & (Z2R_IN_STATUS_OVERFLOW | Z2R_IN_STATUS_FRAME_ERR)) {
-            if (log) fprintf(log, "z2rtg link: real board input%s%s\n", st & Z2R_IN_STATUS_OVERFLOW ? " overflow" : "",
-                             st & Z2R_IN_STATUS_FRAME_ERR ? " frame error" : "");
-            const uint16_t w1c = st & (Z2R_IN_STATUS_OVERFLOW | Z2R_IN_STATUS_FRAME_ERR);
+        const uint8_t *v = popped ? r + 1 : r;
+        const uint16_t st = static_cast<uint16_t>(v[0] << 8 | v[1]);
+        if (const uint16_t w1c = st & (Z2R_IN_STATUS_OVERFLOW | Z2R_IN_STATUS_FRAME_ERR)) {
+            if (st & Z2R_IN_STATUS_OVERFLOW) in_overflows++;
+            if (st & Z2R_IN_STATUS_FRAME_ERR) in_frame_errs++;
+            if (log && in_overflows + in_frame_errs == 1)
+                fprintf(log, "z2rtg link: real board input %s (counted in the progress line from now on)\n",
+                        st & Z2R_IN_STATUS_OVERFLOW ? "overflow: events were lost" : "frame error");
             const uint8_t clr[6] = {'W', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_STATUS),
                                     static_cast<uint8_t>(w1c >> 8), static_cast<uint8_t>(w1c)};
             uint8_t k = 0;
@@ -311,17 +322,28 @@ void Z2rtgLink::poll_input()
         if (!(st & Z2R_IN_STATUS_AVAIL))
             return;
         // EV0 = type:p0, EV1 = p1:p2, EV2 = p3:p4, EV3 = p5:-
-        std::array<uint8_t, 7> ev {r[4], r[5], r[6], r[7], r[8], r[9], r[10]};
-        const uint8_t pop[6] = {'W', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_POP), 0, Z2R_IN_POP_POP};
-        uint8_t k = 0;
-        if (!send(pop, 6) || recv(&k, 1, 500) != 1 || k != 'k')
-            return;
+        std::array<uint8_t, 7> ev {v[4], v[5], v[6], v[7], v[8], v[9], v[10]};
         {
             std::lock_guard<std::mutex> g(mx);
             evq.push_back(ev);
         }
         events++;
+        if (!send(pop_rd, sizeof pop_rd))
+            return;
+        popped = true;
     }
+    // the loop limit was reached right after a pop + read: take its answer, the next poll reads again
+    if (popped && !lost) {
+        recv(r, 13, 500);
+    }
+}
+
+void Z2rtgLink::maybe_poll_input()
+{
+    if (!input || lost || std::chrono::steady_clock::now() < next_input)
+        return;
+    poll_input();
+    next_input = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
 }
 
 void Z2rtgLink::run()
@@ -329,12 +351,9 @@ void Z2rtgLink::run()
     std::vector<Item> work;
     std::vector<uint16_t> run_w;
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    auto next_input = std::chrono::steady_clock::now();
+    next_input = std::chrono::steady_clock::now();
     for (;;) {
-        if (input && !lost && std::chrono::steady_clock::now() >= next_input) {
-            poll_input();
-            next_input = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
-        }
+        maybe_poll_input();
         {
             std::unique_lock<std::mutex> g(mx);
             cv.wait_for(g, std::chrono::milliseconds(input ? 5 : 20), [this] { return stop || !q.empty(); });
@@ -353,12 +372,18 @@ void Z2rtgLink::run()
             // progress every 10 s: a link far behind the emulated board shows as a growing backlog
             if (log && std::chrono::steady_clock::now() >= next_report) {
                 next_report += std::chrono::seconds(10);
-                fprintf(log, "z2rtg link: %llu words in %llu bursts, %llu polls, %llu errors, %zu writes waiting\n",
+                fprintf(log, "z2rtg link: %llu words in %llu bursts, %llu polls, %llu errors, %zu writes waiting",
                         (unsigned long long)words, (unsigned long long)bursts, (unsigned long long)polls,
                         (unsigned long long)errors, work.size() - i);
+                if (input)
+                    fprintf(log, "; input %llu events, %llu overflows, %llu frame errors",
+                            (unsigned long long)events, (unsigned long long)in_overflows,
+                            (unsigned long long)in_frame_errs);
+                fputc('\n', log);
                 fflush(log);
             }
             if (work[i].wait) {
+                maybe_poll_input();
                 blitter_idle();
                 i++;
                 continue;
@@ -371,6 +396,7 @@ void Z2rtgLink::run()
                        work[i].off == start + 2 * run_w.size())
                     run_w.push_back(work[i++].v);
                 burst(start, run_w.data(), static_cast<unsigned>(run_w.size()));
+                maybe_poll_input();
                 continue;
             }
             // VRAM up to the next register write or blitter wait: the order inside does not matter, only
@@ -387,6 +413,7 @@ void Z2rtgLink::run()
                 while (it != seg.end() && run_w.size() < BURST && it->first == start + 2 * run_w.size())
                     run_w.push_back((it++)->second);
                 burst(start, run_w.data(), static_cast<unsigned>(run_w.size()));
+                maybe_poll_input();              // between bursts, so a long redraw does not starve the input
             }
         }
         drain();
