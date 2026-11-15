@@ -20,7 +20,8 @@
 //     redraws everything; start.sh names the port by its /dev/serial/by-id link, which follows the module.
 //   - Transport: the serial port itself, or ("unix:PATH" or a socket path) the Unix socket of z2bridged.py,
 //     which carries the same protocol and shares the board with other programs (README.md). A socket the
-//     daemon closes counts as a lost port.
+//     daemon closes counts as a lost port. Replies through the daemon are waited for up to 10 minutes,
+//     since it holds this link's commands while a host tool holds the board (the emulation stalls then).
 // SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef Z2RTG_LINK_H
 #define Z2RTG_LINK_H

@@ -222,8 +222,15 @@ bool Z2rtgLink::send(const uint8_t *p, size_t n)
     return true;
 }
 
+// Through z2bridged the daemon answers every command itself ('e' when the board does not), and holds this
+// client's commands while another client holds the board, so the wait there is long: the emulation stalls
+// meanwhile. A daemon that goes away closes the socket.
+static constexpr int SOCK_WAIT_MS = 600000;
+
 int Z2rtgLink::recv(uint8_t *p, size_t n, int timeout_ms)
 {
+    if (sock && timeout_ms < SOCK_WAIT_MS)
+        timeout_ms = SOCK_WAIT_MS;
     size_t got = 0;
     auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (got < n) {

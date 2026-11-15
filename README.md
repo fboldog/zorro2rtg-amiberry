@@ -64,7 +64,9 @@ The socket carries the Nano 20K debug bridge's own byte protocol (the main proje
 | Burst read | `S a2 a1 a0 n` | n+1 words |
 
 Values are big-endian; the offset is the 24-bit offset in the 4 MB board window, and `e` means refused. The
-same link code therefore drives a serial port or the daemon unchanged.
+same link code therefore drives a serial port or the daemon unchanged. The daemon adds `L` and `U`, with which a
+host tool holds the board for a while; the link never sends them, but its commands then wait in the daemon, so
+through a socket it waits up to 10 minutes for a reply and the emulation stalls meanwhile.
 
 The daemon `sw/tools/host/z2bridged.py` lives in the main project. It owns the serial port and passes whole
 commands from several clients to it in order. When the bridge refuses something, it answers `e` for every
