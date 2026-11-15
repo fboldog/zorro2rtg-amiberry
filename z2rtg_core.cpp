@@ -320,7 +320,8 @@ bool Z2rtgCore::cursor_pixel(int x, int y, uint32_t &rgb) const
 
 bool Z2rtgCore::showing() const
 {
-    return (ctrl_act & Z2R_CTRL_VIDEO_EN) && !(ctrl_act & Z2R_CTRL_BLANK) &&
+    // CTRL.OUT_OFF acts at once on the board (no vertical blanks while it is set), so it reads ctrl itself
+    return (ctrl_act & Z2R_CTRL_VIDEO_EN) && !(ctrl_act & Z2R_CTRL_BLANK) && !(ctrl & Z2R_CTRL_OUT_OFF) &&
            mode_act < 16 && ((K_MODES >> mode_act) & 1) &&
            (format_act == Z2R_PIXEL_FORMAT_RGB565 || format_act == Z2R_PIXEL_FORMAT_CLUT8);
 }
