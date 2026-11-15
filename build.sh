@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build Amiberry v8.5.0 with the Zorro2RTG board (docs/driver.md), the way the AUR PKGBUILD builds it.
-#   sw/emu/amiberry/build.sh [SRC]   default SRC: ~/amiberry-zorro2/src, the project's isolated Amiberry
+# Build Amiberry v8.5.0 with the Zorro2RTG board (README.md), the way the AUR PKGBUILD builds it.
+#   build.sh [SRC]   default SRC: ~/amiberry-zorro2/src, the Zorro2-Tang25k project's isolated Amiberry
 # Output: SRC/build/amiberry. Run it with AMIBERRY_BIN=SRC/build/amiberry ~/amiberry-zorro2/run.sh ...
 # The system Amiberry (/usr/bin/amiberry) and ~/Amiberry are not touched.
 set -e

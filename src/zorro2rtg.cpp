@@ -223,7 +223,7 @@ static uae_u32 REGPARAM2 z2rtg_bget(uaecptr addr)
     return d->core.read8(addr - d->configured);
 }
 static inline uae_u8 *z2_vram_at(z2rtg_state *d, uaecptr addr);
-// ---- board in the loop (sw/emu/z2rtg_link.h): every write the model takes goes to the real board too
+// ---- board in the loop (z2rtg_link.h): every write the model takes goes to the real board too
 static constexpr uint32_t Z2_LINK_WAIT_BYTES = 16384;  // longer jobs: wait for the real blitter. The bridge
                                                       // buffers 64 bytes (about 210 us at 3 Mbaud) while a job
                                                       // holds its writes back; 16 KB is about 55 us
