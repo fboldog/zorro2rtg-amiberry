@@ -8,6 +8,9 @@
 #include <fcntl.h>
 #include <map>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <termios.h>
 #include <unistd.h>
 #include <vector>
@@ -19,6 +22,68 @@ static constexpr int WINDOW = 4;             // bursts in flight (docs/debug_bri
 static constexpr uint32_t VRAM_START = 0x010000;   // below: registers, palette, cursor image (kept in order)
 
 Z2rtgLink::~Z2rtgLink() { close(); }
+
+// "unix:PATH", or a path that is a socket: the debug-bridge protocol through z2bridged (README.md)
+static bool socket_path(const char *device, std::string &path)
+{
+    if (!strncmp(device, "unix:", 5)) {
+        path = device + 5;
+        return true;
+    }
+    struct stat st {};
+    if (stat(device, &st) == 0 && S_ISSOCK(st.st_mode)) {
+        path = device;
+        return true;
+    }
+    return false;
+}
+
+// sun_path holds 107 characters: a longer path is reached through its directory's /proc/self/fd entry
+// (no chdir, which would race with the emulator's other threads)
+static int connect_unix(const std::string &path)
+{
+    const int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0)
+        return -1;
+    sockaddr_un a {};
+    a.sun_family = AF_UNIX;
+    int dfd = -1;
+    std::string target = path;
+    if (target.size() >= sizeof a.sun_path) {
+        const size_t slash = path.rfind('/');
+        const std::string dir = slash == 0 ? "/" : path.substr(0, slash);
+        dfd = ::open(dir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+        target = "/proc/self/fd/" + std::to_string(dfd) + "/" + path.substr(slash + 1);
+    }
+    int r = -1;
+    if (target.size() < sizeof a.sun_path) {
+        memcpy(a.sun_path, target.c_str(), target.size() + 1);
+        r = connect(s, reinterpret_cast<sockaddr *>(&a), sizeof a);
+    } else {
+        errno = ENAMETOOLONG;
+    }
+    const int e = errno;
+    if (dfd >= 0)
+        ::close(dfd);
+    if (r < 0) {
+        ::close(s);
+        errno = e;
+        return -1;
+    }
+    return s;
+}
+
+// input still waiting after an error: tcflush on the serial port, read and dropped on a socket
+void Z2rtgLink::flush_input()
+{
+    if (!sock) {
+        tcflush(fd, TCIFLUSH);
+        return;
+    }
+    uint8_t buf[512];
+    while (::recv(fd, buf, sizeof buf, MSG_DONTWAIT) > 0) {
+    }
+}
 
 static speed_t baud_const(int baud)
 {
@@ -36,27 +101,45 @@ bool Z2rtgLink::open(const char *device, int baud, FILE *lg)
     log = lg;
     dev = device;
     lost = false;
-    fd = ::open(device, O_RDWR | O_NOCTTY);
-    if (fd < 0) {
-        if (log) fprintf(log, "z2rtg link: %s: %s\n", device, strerror(errno));
-        return false;
+    std::string spath;
+    sock = socket_path(device, spath);
+    if (sock) {
+        fd = connect_unix(spath);
+        if (fd < 0) {
+            if (log) fprintf(log, "z2rtg link: %s: %s (is z2bridged running?)\n", spath.c_str(), strerror(errno));
+            return false;
+        }
+    } else {
+        fd = ::open(device, O_RDWR | O_NOCTTY);
+        if (fd < 0) {
+            if (log) fprintf(log, "z2rtg link: %s: %s\n", device, strerror(errno));
+            return false;
+        }
+        termios t {};
+        tcgetattr(fd, &t);
+        cfmakeraw(&t);
+        t.c_cflag |= CLOCAL | CREAD;
+        cfsetispeed(&t, baud_const(baud));
+        cfsetospeed(&t, baud_const(baud));
+        tcsetattr(fd, TCSANOW, &t);
+        tcflush(fd, TCIOFLUSH);
     }
-    termios t {};
-    tcgetattr(fd, &t);
-    cfmakeraw(&t);
-    t.c_cflag |= CLOCAL | CREAD;
-    cfsetispeed(&t, baud_const(baud));
-    cfsetospeed(&t, baud_const(baud));
-    tcsetattr(fd, TCSANOW, &t);
-    tcflush(fd, TCIOFLUSH);
     uint8_t c = '?', r = 0;
-    if (!send(&c, 1) || recv(&r, 1, 500) != 1 || r != 'Z') {
-        if (log) fprintf(log, "z2rtg link: no bridge ping on %s at %d baud\n", device, baud);
+    if (!send(&c, 1) || recv(&r, 1, sock ? 3000 : 500) != 1 || r != 'Z') {
+        if (sock) {
+            if (log) fprintf(log, "z2rtg link: no bridge ping through %s\n", spath.c_str());
+        } else if (log) {
+            fprintf(log, "z2rtg link: no bridge ping on %s at %d baud\n", device, baud);
+        }
         ::close(fd);
         fd = -1;
         return false;
     }
-    if (log) fprintf(log, "z2rtg link: bridge on %s at %d baud\n", device, baud);
+    if (sock) {
+        if (log) fprintf(log, "z2rtg link: bridge through z2bridged at %s\n", spath.c_str());
+    } else if (log) {
+        fprintf(log, "z2rtg link: bridge on %s at %d baud\n", device, baud);
+    }
     stop = false;
     th = std::thread(&Z2rtgLink::run, this);
     return true;
@@ -126,7 +209,8 @@ bool Z2rtgLink::send(const uint8_t *p, size_t n)
     while (n) {
         if (lost)
             return false;
-        ssize_t k = ::write(fd, p, n);
+        // a socket whose daemon went away must not raise SIGPIPE in the emulator
+        ssize_t k = sock ? ::send(fd, p, n, MSG_NOSIGNAL) : ::write(fd, p, n);
         if (k < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             port_lost(strerror(errno));
@@ -196,7 +280,7 @@ bool Z2rtgLink::recover()
 {
     for (int attempt = 0; attempt < 3 && !lost; attempt++) {
         usleep(30000);
-        tcflush(fd, TCIFLUSH);
+        flush_input();
         bool ok = true;
         while (ok && !inflight.empty()) {
             const std::vector<uint8_t> &p = inflight.front();
@@ -260,7 +344,7 @@ bool Z2rtgLink::blitter_idle()
             errors++;
             if (log) fprintf(log, "z2rtg link: no answer to a STATUS read, retrying\n");
             usleep(30000);                       // a refused read: resynchronise and ask again
-            tcflush(fd, TCIFLUSH);
+            flush_input();
             continue;
         }
         if (!((r[0] << 8 | r[1]) & Z2R_STATUS_BLT_BUSY))
@@ -301,7 +385,7 @@ void Z2rtgLink::poll_input()
                 errors++;
                 if (log) fprintf(log, "z2rtg link: no answer to an IN_STATUS read\n");
                 usleep(30000);
-                tcflush(fd, TCIFLUSH);
+                flush_input();
             }
             return;
         }

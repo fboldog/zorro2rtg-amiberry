@@ -1,5 +1,5 @@
 // Board-in-the-loop link: mirrors the emulated board's writes to a real Nano 20K through the UART debug
-// bridge (docs/debug_bridge.md, docs/driver.md). The real gateware then shows what the emulated Amiga
+// bridge (docs/debug_bridge.md, docs/driver.md in the Zorro2-Tang25k project). The real gateware then shows what the emulated Amiga
 // draws on its own HDMI output. Emulator-independent, POSIX.
 //   - One queue, so the real board sees the writes in the model's order. Consecutive word offsets are
 //     sent as bursts of up to 256 words, with up to four bursts in flight.
@@ -18,6 +18,9 @@
 //     and the link stops: is_open() turns false and nothing more is sent. The real board then keeps its last
 //     picture. The next Autoconfig (a reset of the emulated Amiga) opens the port again, and the reboot
 //     redraws everything; start.sh names the port by its /dev/serial/by-id link, which follows the module.
+//   - Transport: the serial port itself, or ("unix:PATH" or a socket path) the Unix socket of z2bridged.py,
+//     which carries the same protocol and shares the board with other programs (README.md). A socket the
+//     daemon closes counts as a lost port.
 // SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef Z2RTG_LINK_H
 #define Z2RTG_LINK_H
@@ -37,7 +40,8 @@
 class Z2rtgLink {
 public:
     ~Z2rtgLink();
-    // opens the serial port (raw 8N1) and pings the bridge; log may be null
+    // opens the serial port (raw 8N1), or with "unix:PATH" or a socket path z2bridged's Unix socket, which
+    // carries the same protocol; then pings the bridge. log may be null
     bool open(const char *device, int baud, FILE *log);
     bool is_open() const { return fd >= 0 && !lost; }
     void write(uint32_t offset, uint16_t value);       // a word at a board offset (even)
@@ -53,6 +57,7 @@ public:
 private:
     struct Item { uint32_t off; uint16_t v; bool wait; };
     int fd = -1;
+    bool sock = false;                           // fd is a Unix socket to z2bridged, not the serial port
     std::atomic<bool> lost {false};              // the port failed: stop sending
     std::string dev;
     FILE *log = nullptr;
@@ -67,6 +72,7 @@ private:
 
     void run();
     void port_lost(const char *what);
+    void flush_input();
     bool send(const uint8_t *p, size_t n);
     int recv(uint8_t *p, size_t n, int timeout_ms);
     bool ack();
