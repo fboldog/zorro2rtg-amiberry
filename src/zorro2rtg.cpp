@@ -227,6 +227,10 @@ static inline uae_u8 *z2_vram_at(z2rtg_state *d, uaecptr addr);
 static constexpr uint32_t Z2_LINK_WAIT_BYTES = 16384;  // longer jobs: wait for the real blitter. The bridge
                                                       // buffers 64 bytes (about 210 us at 3 Mbaud) while a job
                                                       // holds its writes back; 16 KB is about 55 us
+static constexpr uint32_t Z2_LINK_WAIT_ROWS = 64;     // taller jobs too: each row costs the real blitter a
+                                                      // fixed setup however narrow it is, so a 1x708 border
+                                                      // fill outlasts the next command and that BLT_OP is
+                                                      // refused (STATUS.BLT_ERR). VERIFY the per-row cost
 static void z2_link_reg(z2rtg_state *d, uint32_t off, uint16_t v, uint32_t jobs_before, uint32_t bytes_before)
 {
     if (!d->link.is_open())
@@ -234,7 +238,7 @@ static void z2_link_reg(z2rtg_state *d, uint32_t off, uint16_t v, uint32_t jobs_
     d->link.write(off, v);
     // a job the model started: wait for the real one when it may outlast the next command on the UART
     if ((off & ~1u) == Z2R_REG_BLT_OP && d->core.blt_jobs != jobs_before &&
-        d->core.blt_bytes - bytes_before >= Z2_LINK_WAIT_BYTES)
+        (d->core.blt_bytes - bytes_before >= Z2_LINK_WAIT_BYTES || d->core.blt_h >= Z2_LINK_WAIT_ROWS))
         d->link.wait_blitter();
 }
 static void z2_link_vram(z2rtg_state *d, uaecptr addr)
