@@ -5,6 +5,7 @@
 extern "C" {
 void *z2_new() { return new Z2rtgCore(); }
 void z2_free(void *c) { delete static_cast<Z2rtgCore *>(c); }
+void z2_reset(void *c) { static_cast<Z2rtgCore *>(c)->reset(); }
 unsigned z2_rd16(void *c, unsigned off) { return static_cast<Z2rtgCore *>(c)->read16(off); }
 void z2_wr16(void *c, unsigned off, unsigned v, unsigned be) { static_cast<Z2rtgCore *>(c)->write16(off, v, be); }
 unsigned z2_rd8(void *c, unsigned off) { return static_cast<Z2rtgCore *>(c)->read8(off); }

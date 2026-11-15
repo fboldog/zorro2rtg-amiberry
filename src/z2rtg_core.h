@@ -83,6 +83,7 @@ struct Z2rtgCore {
     // one Amiga line; returns true at vblank_start
     bool hsync();
     bool in_vblank() const { return line >= LINES_PER_FRAME - VBLANK_LINES; }
+    bool out_off() const;                             // CTRL.OUT_OFF, which acts at once, not at vblank
     bool blt_busy() const { return now_ns < blt_busy_until; }
 
     // what the HDMI output shows: false means black (disabled, blanked, unsupported mode or format)

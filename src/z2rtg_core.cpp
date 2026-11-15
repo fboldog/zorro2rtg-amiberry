@@ -33,7 +33,12 @@ void Z2rtgCore::reset()
     dst_hi_st = src_hi_st = fg_hi_st = bg_hi_st = 0;
     blt_busy_until = 0;
     line = 0;
-    in_irq_en = false;                                // the queue itself keeps its events, as the gateware does
+    // the USB input receiver is reset with the bus too (usb_input on bus_reset in zorro2rtg_top.v): queued
+    // events, a half-received frame and the error flags all go
+    in_irq_en = false;
+    in_q.clear();
+    in_n = 0;
+    in_ovf = in_ferr = false;
 }
 
 // ------------------------------------------------------------------ USB input
@@ -143,7 +148,7 @@ uint16_t Z2rtgCore::read_reg(uint32_t o)
                                      (blt_busy() ? Z2R_STATUS_BLT_BUSY : 0) |
                                      (blt_err ? Z2R_STATUS_BLT_ERR : 0) |
                                      (scan_pending ? Z2R_STATUS_SCAN_PENDING : 0) |
-                                     Z2R_STATUS_PLL_LOCK);
+                                     (out_off() ? 0 : Z2R_STATUS_PLL_LOCK));
     case Z2R_REG_MODE:         return mode;
     case Z2R_REG_FORMAT:       return format;
     case Z2R_REG_SCAN_BASE_HI: return static_cast<uint16_t>((scan_base >> 16) & 0x7F);
@@ -286,6 +291,10 @@ void Z2rtgCore::write_reg(uint32_t o, uint16_t v, unsigned be)
 bool Z2rtgCore::hsync()
 {
     now_ns += LINE_NS;
+    // CTRL.OUT_OFF holds the video PLL in reset: the pixel clock stops, so no lines, no vertical blanks and
+    // no FRAME_COUNT (docs/registers.md, "Output off"); IN_VBLANK keeps its last value
+    if (out_off())
+        return false;
     if (++line >= LINES_PER_FRAME) line = 0;
     if (line == LINES_PER_FRAME - VBLANK_LINES) { vblank_start(); return true; }
     return false;
@@ -317,6 +326,8 @@ bool Z2rtgCore::cursor_pixel(int x, int y, uint32_t &rgb) const
     rgb = cursor_col_act[idx - 1];
     return true;
 }
+
+bool Z2rtgCore::out_off() const { return (ctrl & Z2R_CTRL_OUT_OFF) != 0; }
 
 bool Z2rtgCore::showing() const
 {
