@@ -1,22 +1,19 @@
 /*
- * Zorro2RTG (Tang Nano 20K Zorro II RTG card) board emulation for Amiberry.
+ * Amiberry adapter for a zboard plugin (include/zboard_plugin.h), here the Zorro2RTG board in
+ * z2rtg_plugin.cpp, compiled in. Only what needs Amiberry is here: the memory banks, bus time charged to
+ * the CPU, /INT2, switching the display between the chipset and the board, and copying its frames to the
+ * RTG surface. Everything the board does, its options included, is in the plugin (z2rtg_plugin.cpp).
  *
- * Glue between Amiberry's gfxboard_func interface and the emulator-independent board model in
- * z2rtg_core.cpp, which implements docs/registers.md of the Zorro2-Tang25k project: register file,
- * 8 MB VRAM window, scanout (640x480 to 1360x768 in RGB565 and CLUT8, as the gateware; DISPLAY padding is
- * reported but the borders are not drawn) and the blitter.
- * The register area (the first 64 KB) is an I/O bank through the model; the VRAM and staging window
- * above it is a RAM bank on the model's VRAM (with BANK), as the ZZ9000 model maps its VRAM.
- * The model's time (its 64 us lines: blitter busy time, vertical blank, FRAME_COUNT) follows the emulated
- * CPU clock, read at every board access and on each hsync callback, so BLT_BUSY resolves to the CPU cycle
- * inside a line. (An earlier note here said Amiberry stops calling the hsync callback after the boot-time
- * reset. Instrumented on v8.5.0 on 2026-11-14, it runs every line after the boot reset and after a reboot
- * of the running machine, so the note was wrong.)
- * USB input and boot ROM (docs/usb_input.md): Z2RTG_BOOTROM=FILE loads the boot ROM image into the BOOTROM window
- * (default: none, the window reads 0 and the DiagArea is ignored); Z2RTG_INPUT=FIFO reads single-wire link frames
- * from a named pipe (sw/tools/host/z2sendkeys.py writes them); Z2RTG_INPUT=bridge, with Z2RTG_BRIDGE, takes the
- * events from the real board's queue instead (a keyboard and mouse on its RP2040). A 1 ms event polls the pipe and raises INT2 while
- * the card requests it, since the line is level-triggered.
+ * - The board's IO regions use the I/O bank gfxboard.cpp maps at Autoconfig; its RAM regions (VRAM and
+ *   staging) get a RAM bank with a direct pointer, as the ZZ9000 model maps its VRAM. Every access still
+ *   goes through the plugin. Longwords are two word cycles, high word first, as on Zorro II.
+ * - Time: the plugin gets the emulated CPU time in ns with every call, from get_cycles() at 227 colour
+ *   clocks per 64 us line, so the model's lines stay in step with the chipset's.
+ * - The hsync callback ticks the plugin every line (it runs every line after the boot reset and after a
+ *   reboot, instrumented on v8.5.0 on 2026-11-14); the levels it returns are raised as long as it requests
+ *   them, since /INT2 is level-triggered.
+ * - The Autoconfig data is the board's row in gfxboard.cpp, added by integrate.py; it must match the
+ *   plugin's zbp_desc. A loader that reads the description instead is for a later Amiberry change.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -33,374 +30,159 @@
 #include "newcpu.h"
 #include "devices.h"
 
-#include <algorithm>
-#include <cstdio>
-#include <fcntl.h>
-#include <unistd.h>
-#include <cstdlib>
-#include <cstring>
 #include <new>
-#include <vector>
 
-#include "z2rtg_core.h"
-#include "z2rtg_link.h"
-#include "zorro2rtg_regs.h"
+#include "zboard_plugin.h"
 
-static constexpr uae_u32 Z2RTG_SIZE = 0x00400000;   // 4 MB Zorro II board
-
-struct z2rtg_state {
-    Z2rtgCore core;
+struct zb_state {
+    const zbp_api *api = nullptr;
+    zbp_board *b = nullptr;
+    zbp_host host {};
     int devnum = -1;
     int monitor_id = 0;
-    uae_u32 configured = 0;
-    bool enabled = false;       // Amiberry has this board's display selected (toggle)
-    int shown_w = 0, shown_h = 0; // the size Amiberry's RTG view was last set to
-    bool rtg_on = false;        // last value passed to gfxboard_set
+    uae_u32 base = 0;            // configured address, 0 before Autoconfig
+    uae_u32 size = 0;
+    bool enabled = false;        // Amiberry has this board's display selected (toggle)
+    bool rtg_on = false;         // what the board last asked for (host.display)
     bool mode_changed = true;
-    std::vector<uae_u8> line;
-    uae_u32 last_jobs = 0;
-    int trace = 0;               // Z2RTG_TRACE=N: log the first N register writes
-    uae_u32 dump_dst = 0, dump_stride = 0, dump_w = 0, dump_h = 0, dump_fg = 0;   // Z2RTG_TRACE_TPL
-    bool no_cursor = false;      // Z2RTG_NOCURSOR=1: leave the hardware cursor out (shows it is the one drawn)
-    int trace_blt = 0;           // Z2RTG_TRACE_BLT=N: log the first N blitter jobs
-    uae_u32 status_reads = 0;
-    uae_u32 hsyncs = 0;
-    uae_u32 reg_reads[64] = {};  // reads of each register word $00-$7E, for the trace
-    FILE *tf = nullptr;          // Z2RTG_TRACE_FILE: trace written here, flushed per line
-    Z2rtgLink link;              // Z2RTG_BRIDGE=/dev/ttyUSBn: mirror every write to a real Nano 20K
-    evt_t last_cycles = 0;
-    int in_fd = -1;              // Z2RTG_INPUT: the link frames' named pipe
+    int shown_w = 0, shown_h = 0;
 };
 
-static void z2_follow_video_en(z2rtg_state *d);
-static z2rtg_state *z2rtg_boards[MAX_RTG_BOARDS];
+static zb_state *zb_boards[MAX_RTG_BOARDS];
 
-// every 1 ms of emulated time: link bytes from Z2RTG_INPUT into the model, and INT2 while the card requests it
-static constexpr evt_t TICK = 3547;   // colour clocks, PAL
-static void z2_tick(uae_u32 devnum)
+static constexpr uint64_t LINE_NS = 64000, LINE_CCK = 227;
+
+// emulated time in ns: colour clocks at 227 per 64 us line
+static uint64_t zb_now()
 {
-    z2rtg_state *d = devnum < MAX_RTG_BOARDS ? z2rtg_boards[devnum] : nullptr;
-    if (!d || !d->configured)
-        return;
-    if (d->in_fd >= 0) {
-        uint8_t buf[256];
-        ssize_t n = read(d->in_fd, buf, sizeof buf);
-        for (ssize_t i = 0; i < n; i++)
-            d->core.in_link_byte(buf[i]);
-    }
-    // Z2RTG_INPUT=bridge: only as many as the emulated queue has room for; the rest wait in the link, so an
-    // emulated Amiga that is busy (a long redraw) delays events instead of losing them
-    std::array<uint8_t, 7> ev;
-    while (d->core.in_q.size() < Z2rtgCore::IN_DEPTH && d->link.take_event(ev))
-        d->core.in_event(ev);
-    if (d->core.int_req())
-        safe_interrupt_set(IRQ_SOURCE_GFX, d->monitor_id, false);
-    event2_newevent_xx(-1, TICK * CYCLE_UNIT, devnum, z2_tick);
-}
-static void z2_tick_start(z2rtg_state *d)
-{
-    if (!event2_newevent_x_exists(z2_tick))
-        event2_newevent_xx(-1, TICK * CYCLE_UNIT, static_cast<uae_u32>(d->devnum), z2_tick);
+    return static_cast<uint64_t>(static_cast<unsigned __int128>(get_cycles()) * LINE_NS / (LINE_CCK * CYCLE_UNIT));
 }
 
-// advance the model to the emulated CPU time, one 64 us line (227 colour clocks) at a time
-static void z2_advance(z2rtg_state *d)
+static void zb_charge(void *, uint32_t ns)
 {
-    const evt_t line = static_cast<evt_t>(227) * CYCLE_UNIT;
-    const evt_t now = get_cycles();
-    z2_tick_start(d);
-    if (now < d->last_cycles || now - d->last_cycles > line * 100000) {
-        d->last_cycles = now;              // first call, or a jump (reset, state load): resync
-        d->core.blt_busy_until = 0;
-        return;
-    }
-    while (now - d->last_cycles >= line) {
-        d->last_cycles += line;
-        if (d->core.hsync())
-            z2_follow_video_en(d);
-        if (d->tf && !(++d->hsyncs % 50000)) {
-            fprintf(d->tf, "%u lines, frame %u, blitter jobs %u, reads:", d->hsyncs, d->core.frame_count,
-                    d->core.blt_jobs);
-            for (int i = 0; i < 64; i++)
-                if (d->reg_reads[i])
-                    fprintf(d->tf, " %02x:%u", i * 2, d->reg_reads[i]);
-            fprintf(d->tf, "\n");
-            fflush(d->tf);
-        }
-    }
-    // BLT_BUSY at CPU-cycle resolution: model time = the lines done + the part of the current one
-    d->core.now_ns = d->core.now_ns - d->core.now_ns % Z2rtgCore::LINE_NS +
-                     static_cast<uint64_t>(now - d->last_cycles) * Z2rtgCore::LINE_NS / static_cast<uint64_t>(line);
+    const evt_t cck = (static_cast<evt_t>(ns) * LINE_CCK + LINE_NS / 2) / LINE_NS;
+    if (cck)
+        x_do_cycles(cck * CYCLE_UNIT);
 }
 
-static void z2_trace(z2rtg_state *d, uae_u32 off, uae_u32 v, int size)
+static void zb_display(void *ctx, int on)
 {
-    if (d->trace_blt > 0 && off == Z2R_REG_BLT_OP && d->tf) {
-        const Z2rtgCore &c = d->core;
-        d->trace_blt--;
-        if (d->dump_w && getenv("Z2RTG_TRACE_TPL")) {   // the last EXPAND's destination, as it is now
-            fprintf(d->tf, "dst of last expand, 16-bit (# = its fg %04x):\n", d->dump_fg);
-            for (unsigned y = 0; y < d->dump_h; y++) {
-                fprintf(d->tf, "  %3u ", y);
-                for (unsigned x = 0; x < d->dump_w; x++) {
-                    const unsigned a = (d->dump_dst + y * d->dump_stride + x * 2) & (Z2rtgCore::VRAM_BYTES - 2);
-                    fputc(((c.vram[a] << 8) | c.vram[a + 1]) == d->dump_fg ? '#' : '.', d->tf);
-                }
-                fputc('\n', d->tf);
-            }
-            d->dump_w = 0;
-        }
-        if (v == Z2R_BLITTER_OP_EXPAND && c.blt_w <= 160 && c.blt_h <= 120) {
-            d->dump_dst = c.blt_dst; d->dump_stride = c.blt_dst_stride; d->dump_w = c.blt_w; d->dump_h = c.blt_h; d->dump_fg = c.blt_fg & 0xffff;
-        }
-        fprintf(d->tf, "blt op %u dst %06x/%u src %06x/%u %ux%u fg %04x bg %04x mode %04x rop %u\n", v, c.blt_dst,
-                c.blt_dst_stride, c.blt_src, c.blt_src_stride, c.blt_w, c.blt_h, c.blt_fg & 0xffff,
-                c.blt_bg & 0xffff, c.blt_mode, c.blt_rop);
-        if (v == Z2R_BLITTER_OP_EXPAND && getenv("Z2RTG_TRACE_TPL") && c.blt_w <= 160 && c.blt_h <= 120) {
-            const unsigned ofs = (c.blt_mode >> Z2R_BLT_MODE_BITOFS_SHIFT) & 15;
-            for (unsigned y = 0; y < c.blt_h; y++) {
-                fprintf(d->tf, "  %3u ", y);
-                for (unsigned x = 0; x < c.blt_w; x++) {
-                    const unsigned b = ofs + x, a = c.sdram_addr(c.blt_src) + y * c.blt_src_stride + (b >> 3);
-                    fputc(a < c.vram.size() && (c.vram[a] & (0x80 >> (b & 7))) ? '#' : '.', d->tf);
-                }
-                fputc('\n', d->tf);
-            }
-        }
-        fflush(d->tf);
-    }
-    if (d->trace > 0 && off < 0x10000 && d->tf) {
-        d->trace--;
-        fprintf(d->tf, "frame %u line %d: wr%d %04x = %04x  busy %u\n", d->core.frame_count, d->core.line,
-                size, off, v, d->core.blt_busy() ? 1u : 0u);
-        fflush(d->tf);
-    }
+    auto *d = static_cast<zb_state *>(ctx);
+    d->rtg_on = on != 0;
+    d->mode_changed = true;
+    gfxboard_set(d->monitor_id, d->rtg_on);
 }
 
-
-// Zorro II bus time per word access, in colour clocks (281.9 ns): a cycle is 4 clocks of 7.09 MHz,
-// 2 colour clocks. Writes go into the card's posted-write FIFO, reads hold XRDY until the data is back.
-// Placeholders, VERIFY on the A2000 (z2test BENCH). Z2RTG_BUS=0 turns the charge off.
-static int z2_bus_write = 2, z2_bus_read = 3;
-static inline void z2_bus(int ccks)
+static void zb_log(void *, int, const char *msg)
 {
-    if (ccks)
-        x_do_cycles(ccks * CYCLE_UNIT);
+    write_log(_T("%s\n"), msg);
 }
 
-static z2rtg_state *z2_find(uaecptr addr)
+static zb_state *zb_find(uaecptr addr)
 {
-    for (auto *d : z2rtg_boards)
-        if (d && d->configured && addr >= d->configured && addr < d->configured + Z2RTG_SIZE)
+    for (auto *d : zb_boards)
+        if (d && d->base && addr >= d->base && addr < d->base + d->size)
             return d;
     return nullptr;
 }
 
-static uae_u32 REGPARAM2 z2rtg_wget(uaecptr addr)
+static uae_u32 REGPARAM2 zb_wget(uaecptr addr)
 {
-    z2rtg_state *d = z2_find(addr);
+    zb_state *d = zb_find(addr);
+    return d ? d->api->read(d->b, addr - d->base, 2, zb_now()) : 0;
+}
+static uae_u32 REGPARAM2 zb_lget(uaecptr addr)
+{
+    return (zb_wget(addr) << 16) | zb_wget(addr + 2);
+}
+static uae_u32 REGPARAM2 zb_bget(uaecptr addr)
+{
+    zb_state *d = zb_find(addr);
+    return d ? d->api->read(d->b, addr - d->base, 1, zb_now()) : 0;
+}
+static void REGPARAM2 zb_wput(uaecptr addr, uae_u32 v)
+{
+    if (zb_state *d = zb_find(addr))
+        d->api->write(d->b, addr - d->base, v & 0xffff, 2, zb_now());
+}
+static void REGPARAM2 zb_lput(uaecptr addr, uae_u32 v)
+{
+    zb_wput(addr, v >> 16);
+    zb_wput(addr + 2, v & 0xffff);
+}
+static void REGPARAM2 zb_bput(uaecptr addr, uae_u32 v)
+{
+    if (zb_state *d = zb_find(addr))
+        d->api->write(d->b, addr - d->base, v & 0xff, 1, zb_now());
+}
+static uae_u8 *REGPARAM2 zb_xlate(uaecptr addr)
+{
+    zb_state *d = zb_find(addr);
+    const uint8_t *p = d ? d->api->ptr(d->b, addr - d->base, 1) : nullptr;
+    // Amiberry's xlate is not const; the CPU only fetches through it
+    return p ? const_cast<uae_u8 *>(p) : default_xlate(addr);
+}
+static int REGPARAM2 zb_check(uaecptr addr, uae_u32 size)
+{
+    zb_state *d = zb_find(addr);
     if (!d)
         return 0;
-    z2_advance(d);
-    z2_bus(z2_bus_read);
-    if (addr - d->configured == 8)
-        d->status_reads++;
-    if (addr - d->configured < 0x80)
-        d->reg_reads[(addr - d->configured) >> 1]++;
-    return d->core.read16(addr - d->configured);
-}
-static uae_u32 REGPARAM2 z2rtg_lget(uaecptr addr)
-{
-    return (z2rtg_wget(addr) << 16) | z2rtg_wget(addr + 2);
-}
-static uae_u32 REGPARAM2 z2rtg_bget(uaecptr addr)
-{
-    z2rtg_state *d = z2_find(addr);
-    if (!d)
-        return 0;
-    z2_advance(d);
-    z2_bus(z2_bus_read);
-    return d->core.read8(addr - d->configured);
-}
-static inline uae_u8 *z2_vram_at(z2rtg_state *d, uaecptr addr);
-// ---- board in the loop (z2rtg_link.h): every write the model takes goes to the real board too
-static constexpr uint32_t Z2_LINK_WAIT_BYTES = 16384;  // longer jobs: wait for the real blitter. The bridge
-                                                      // buffers 64 bytes (about 210 us at 3 Mbaud) while a job
-                                                      // holds its writes back; 16 KB is about 55 us
-static constexpr uint32_t Z2_LINK_WAIT_ROWS = 64;     // taller jobs too: each row costs the real blitter a
-                                                      // fixed setup however narrow it is, so a 1x708 border
-                                                      // fill outlasts the next command and that BLT_OP is
-                                                      // refused (STATUS.BLT_ERR). VERIFY the per-row cost
-static void z2_link_reg(z2rtg_state *d, uint32_t off, uint16_t v, uint32_t jobs_before, uint32_t bytes_before)
-{
-    if (!d->link.is_open())
-        return;
-    d->link.write(off, v);
-    // a job the model started: wait for the real one when it may outlast the next command on the UART
-    if ((off & ~1u) == Z2R_REG_BLT_OP && d->core.blt_jobs != jobs_before &&
-        (d->core.blt_bytes - bytes_before >= Z2_LINK_WAIT_BYTES || d->core.blt_h >= Z2_LINK_WAIT_ROWS))
-        d->link.wait_blitter();
-}
-static void z2_link_vram(z2rtg_state *d, uaecptr addr)
-{
-    if (!d->link.is_open())
-        return;
-    const uae_u8 *p = z2_vram_at(d, addr & ~1u);
-    d->link.write((addr - d->configured) & ~1u, static_cast<uint16_t>((p[0] << 8) | p[1]));
+    const uae_u32 off = addr - d->base;
+    const zbp_desc *desc = d->api->desc;
+    for (uint32_t i = 0; i < desc->n_regions; i++) {
+        const zbp_region &r = desc->regions[i];
+        if (r.kind == ZBP_REGION_RAM && off >= r.offset && size <= r.size && off - r.offset <= r.size - size)
+            return 1;
+    }
+    return 0;
 }
 
-static void REGPARAM2 z2rtg_wput(uaecptr addr, uae_u32 v)
-{
-    z2rtg_state *d = z2_find(addr);
-    if (d) {
-        z2_advance(d);
-        z2_bus(z2_bus_write);
-        z2_trace(d, addr - d->configured, v & 0xffff, 2);
-        const uint32_t jobs = d->core.blt_jobs, bytes = d->core.blt_bytes;
-        d->core.write16(addr - d->configured, static_cast<uint16_t>(v), 3);
-        z2_link_reg(d, addr - d->configured, static_cast<uint16_t>(v), jobs, bytes);
-    }
-}
-static void REGPARAM2 z2rtg_lput(uaecptr addr, uae_u32 v)
-{
-    z2rtg_wput(addr, v >> 16);           // Zorro II: two word cycles, high word first
-    z2rtg_wput(addr + 2, v & 0xffff);
-}
-static void REGPARAM2 z2rtg_bput(uaecptr addr, uae_u32 v)
-{
-    z2rtg_state *d = z2_find(addr);
-    if (d) {
-        z2_advance(d);
-        z2_bus(z2_bus_write);
-        z2_trace(d, addr - d->configured, v & 0xff, 1);
-        const uint32_t off = addr - d->configured, jobs = d->core.blt_jobs, bytes = d->core.blt_bytes;
-        d->core.write8(off, static_cast<uint8_t>(v));
-        // the bridge writes whole words: the byte in its lane, the other lane as the model now reads it
-        // (STATUS: 0, so no other W1C bit is cleared)
-        uint16_t w = (off & ~1u) == Z2R_REG_STATUS ? 0 : d->core.read16(off & ~1u);
-        w = (off & 1) ? static_cast<uint16_t>((w & 0xFF00) | (v & 0xFF)) : static_cast<uint16_t>((w & 0x00FF) | ((v & 0xFF) << 8));
-        z2_link_reg(d, off & ~1u, w, jobs, bytes);
-    }
-}
-
-// VRAM and staging window, board offsets $10000-$3FFFFF: plain memory, big-endian
-static inline uae_u8 *z2_vram_at(z2rtg_state *d, uaecptr addr)
-{
-    return &d->core.vram[d->core.sdram_addr(addr - d->configured) & (Z2rtgCore::VRAM_BYTES - 1)];
-}
-static uae_u32 REGPARAM2 z2rtg_vram_lget(uaecptr addr)
-{
-    z2rtg_state *d = z2_find(addr);
-    z2_bus(2 * z2_bus_read);
-    if (!d) return 0;
-    const uae_u8 *p = z2_vram_at(d, addr);
-    return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
-}
-static uae_u32 REGPARAM2 z2rtg_vram_wget(uaecptr addr)
-{
-    z2rtg_state *d = z2_find(addr);
-    z2_bus(z2_bus_read);
-    if (!d) return 0;
-    const uae_u8 *p = z2_vram_at(d, addr);
-    return (p[0] << 8) | p[1];
-}
-static uae_u32 REGPARAM2 z2rtg_vram_bget(uaecptr addr)
-{
-    z2rtg_state *d = z2_find(addr);
-    z2_bus(z2_bus_read);
-    return d ? *z2_vram_at(d, addr) : 0;
-}
-static void REGPARAM2 z2rtg_vram_lput(uaecptr addr, uae_u32 v)
-{
-    z2rtg_state *d = z2_find(addr);
-    z2_bus(2 * z2_bus_write);
-    if (!d) return;
-    uae_u8 *p = z2_vram_at(d, addr);
-    p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
-    z2_link_vram(d, addr);
-    z2_link_vram(d, addr + 2);
-}
-static void REGPARAM2 z2rtg_vram_wput(uaecptr addr, uae_u32 v)
-{
-    z2rtg_state *d = z2_find(addr);
-    z2_bus(z2_bus_write);
-    if (!d) return;
-    uae_u8 *p = z2_vram_at(d, addr);
-    p[0] = v >> 8; p[1] = v;
-    z2_link_vram(d, addr);
-}
-static void REGPARAM2 z2rtg_vram_bput(uaecptr addr, uae_u32 v)
-{
-    z2rtg_state *d = z2_find(addr);
-    z2_bus(z2_bus_write);
-    if (!d) return;
-    *z2_vram_at(d, addr) = v;
-    z2_link_vram(d, addr);
-}
-static uae_u8 *REGPARAM2 z2rtg_vram_xlate(uaecptr addr)
-{
-    z2rtg_state *d = z2_find(addr);
-    return d ? z2_vram_at(d, addr) : default_xlate(addr);
-}
-static int REGPARAM2 z2rtg_vram_check(uaecptr addr, uae_u32 size)
-{
-    z2rtg_state *d = z2_find(addr);
-    if (!d) return 0;
-    const uae_u32 off = addr - d->configured;
-    return off >= 0x10000 && off + size <= Z2RTG_SIZE;
-}
-static addrbank z2rtg_vram_bank = {
-    z2rtg_vram_lget, z2rtg_vram_wget, z2rtg_vram_bget,
-    z2rtg_vram_lput, z2rtg_vram_wput, z2rtg_vram_bput,
-    z2rtg_vram_xlate, z2rtg_vram_check, nullptr, _T("*"), _T("Zorro2RTG VRAM"),
-    z2rtg_vram_lget, z2rtg_vram_wget,
+static addrbank zb_ram_bank = {
+    zb_lget, zb_wget, zb_bget,
+    zb_lput, zb_wput, zb_bput,
+    zb_xlate, zb_check, nullptr, _T("*"), _T("Zorro2RTG VRAM"),
+    zb_lget, zb_wget,
     ABFLAG_RAM, S_READ, S_WRITE
 };
 
-static addrbank z2rtg_bank = {
-    z2rtg_lget, z2rtg_wget, z2rtg_bget,
-    z2rtg_lput, z2rtg_wput, z2rtg_bput,
+static addrbank zb_io_bank = {
+    zb_lget, zb_wget, zb_bget,
+    zb_lput, zb_wput, zb_bput,
     default_xlate, default_check, nullptr, nullptr, _T("Zorro2RTG"),
-    z2rtg_lget, z2rtg_wget,
+    zb_lget, zb_wget,
     ABFLAG_IO, S_READ, S_WRITE
 };
 
-// switch Amiberry's window between the chipset and this board as CTRL.VIDEO_EN applies at vertical blank
-static void z2_follow_video_en(z2rtg_state *d)
+static void zb_hsync(void *userdata)
 {
-    const bool on = (d->core.ctrl_act & 1) != 0;   // Z2R_CTRL_VIDEO_EN
-    if (on != d->rtg_on) {
-        d->rtg_on = on;
-        d->mode_changed = true;
-        gfxboard_set(d->monitor_id, on);
-    }
-}
-
-static void z2rtg_hsync(void *userdata)
-{
-    auto *d = static_cast<z2rtg_state *>(userdata);
-    if (!d->configured)
+    auto *d = static_cast<zb_state *>(userdata);
+    if (!d->base)
         return;
-    z2_advance(d);
-    if (d->core.blt_jobs != d->last_jobs && !(d->core.blt_jobs % 1000)) {
-        d->last_jobs = d->core.blt_jobs;
-        write_log(_T("Zorro2RTG: %u blitter jobs, %u bytes\n"), d->core.blt_jobs, d->core.blt_bytes);
-    }
+    const uint32_t irq = d->api->tick(d->b, zb_now());
+    if (irq & (1u << 2))
+        safe_interrupt_set(IRQ_SOURCE_GFX, d->monitor_id, false);
+    if (irq & (1u << 6))
+        safe_interrupt_set(IRQ_SOURCE_GFX, d->monitor_id, true);
 }
 
-static bool z2rtg_vsync(void *userdata, gfxboard_mode *mode)
+static bool zb_vsync(void *userdata, gfxboard_mode *mode)
 {
-    auto *d = static_cast<z2rtg_state *>(userdata);
-    if (!d->configured || !d->enabled)
+    auto *d = static_cast<zb_state *>(userdata);
+    if (!d->base || !d->enabled)
         return false;
-    const int W = d->core.width(), H = d->core.height();   // the active MODE (applied at vertical blank)
-    if (W != d->shown_w || H != d->shown_h) {
-        d->shown_w = W; d->shown_h = H;
+    zbp_frame f {};
+    f.struct_size = sizeof f;
+    if (!d->api->frame(d->b, &f) || f.format != ZBP_FB_RGB565_BE)
+        return false;
+    const int W = f.width, H = f.height;
+    if (f.changed || W != d->shown_w || H != d->shown_h) {
+        d->shown_w = W;
+        d->shown_h = H;
         d->mode_changed = true;
     }
     mode->width = W;
     mode->height = H;
-    mode->mode = RGBFB_R5G6B5;             // big-endian RGB565, as stored in VRAM
+    mode->mode = RGBFB_R5G6B5;             // big-endian RGB565
     mode->hlinedbl = 1;
     mode->vlinedbl = 1;
     const auto &state = picasso96_state[d->monitor_id];
@@ -409,46 +191,18 @@ static bool z2rtg_vsync(void *userdata, gfxboard_mode *mode)
     uae_u8 *surface = gfx_lock_picasso(d->monitor_id, false);
     if (!surface)
         return false;
-    const size_t line_size = W * 2;
-    d->line.resize(line_size);
-    const bool show = d->core.showing();
-    const uint32_t base = d->core.scan_base_act & ~31u, stride = d->core.stride_act & ~31u;
-    for (int y = 0; y < H; y++) {
-        if (show && d->core.format_act == Z2R_PIXEL_FORMAT_CLUT8)
-            // a byte per pixel through the palette (8:8:8 on the board), reduced to the frame's RGB565
-            for (int x = 0; x < W; x++) {
-                const uint32_t c = d->core.palette[d->core.vram[(base + y * stride + x) & (Z2rtgCore::VRAM_BYTES - 1)]];
-                const uint16_t p = static_cast<uint16_t>(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
-                d->line[2 * x] = static_cast<uae_u8>(p >> 8);
-                d->line[2 * x + 1] = static_cast<uae_u8>(p);
-            }
-        else if (show)
-            for (size_t i = 0; i < line_size; i++)
-                d->line[i] = d->core.vram[(base + y * stride + i) & (Z2rtgCore::VRAM_BYTES - 1)];
-        else
-            memset(d->line.data(), 0, line_size);
-        // the hardware cursor over the line, reduced to the frame's RGB565
-        if (show && d->core.cursor_en_act && !d->no_cursor && y >= d->core.cursor_y_act && y < d->core.cursor_y_act + 64)
-            for (int x = std::max(0, static_cast<int>(d->core.cursor_x_act));
-                 x < std::min(W, d->core.cursor_x_act + 64); x++) {
-                uint32_t c;
-                if (d->core.cursor_pixel(x, y, c)) {
-                    const uint16_t p = static_cast<uint16_t>(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F));
-                    d->line[2 * x] = static_cast<uae_u8>(p >> 8);
-                    d->line[2 * x + 1] = static_cast<uae_u8>(p);
-                }
-            }
-        fb_copyrow(d->monitor_id, d->line.data(), surface, 0, 0, W, 2, y);
-    }
+    for (int y = 0; y < H; y++)
+        fb_copyrow(d->monitor_id, const_cast<uae_u8 *>(f.pixels + static_cast<size_t>(y) * f.stride), surface, 0, 0,
+                   W, 2, y);
     d->mode_changed = false;
     gfx_unlock_picasso(d->monitor_id, true);
     return true;
 }
 
-static bool z2rtg_toggle(void *userdata, int mode)
+static bool zb_toggle(void *userdata, int mode)
 {
-    auto *d = static_cast<z2rtg_state *>(userdata);
-    if (!d->configured)
+    auto *d = static_cast<zb_state *>(userdata);
+    if (!d->base)
         return false;
     if (!mode) {
         if (!d->enabled)
@@ -463,107 +217,81 @@ static bool z2rtg_toggle(void *userdata, int mode)
     return true;
 }
 
-static void z2rtg_configured(void *userdata, uae_u32 address)
+static void zb_configured(void *userdata, uae_u32 address)
 {
-    auto *d = static_cast<z2rtg_state *>(userdata);
-    d->configured = address;
-    // registers stay in the I/O bank mapped by gfxboard.cpp; VRAM and staging become memory
-    map_banks(&z2rtg_vram_bank, (address + 0x10000) >> 16, (Z2RTG_SIZE - 0x10000) >> 16, 0);
-    write_log(_T("Zorro2RTG configured at %08x\n"), address);
-    const char *in_src = getenv("Z2RTG_INPUT");
-    const bool in_bridge = in_src && !strcmp(in_src, "bridge");
-    if (const char *f = in_src; f && !in_bridge && d->in_fd < 0) {
-        d->in_fd = open(f, O_RDONLY | O_NONBLOCK);
-        write_log(_T("Zorro2RTG: USB input from %s%s\n"), f, d->in_fd < 0 ? " failed to open" : "");
+    auto *d = static_cast<zb_state *>(userdata);
+    d->base = address;
+    const zbp_desc *desc = d->api->desc;
+    for (uint32_t i = 0; i < desc->n_regions; i++) {
+        const zbp_region &r = desc->regions[i];
+        if (r.kind == ZBP_REGION_RAM)
+            map_banks(&zb_ram_bank, (address + r.offset) >> 16, r.size >> 16, 0);
     }
-    z2_tick_start(d);
-    if (const char *dev = getenv("Z2RTG_BRIDGE")) {
-        const char *b = getenv("Z2RTG_BRIDGE_BAUD");
-        if (d->link.is_open() || d->link.open(dev, b ? atoi(b) : 3000000, d->tf ? d->tf : stderr)) {
-            // the real board starts from the model's power-on state
-            d->link.write(Z2R_REG_CTRL, 0);
-            d->link.write(Z2R_REG_BANK, 0);
-            d->link.write(Z2R_REG_STATUS, Z2R_STATUS_VBLANK | Z2R_STATUS_BLT_ERR);
-            if (in_bridge) {
-                // keyboard and mouse on the real board's USB input (an RP2040 on pin 51) drive the emulated one
-                d->link.enable_input();
-                write_log(_T("Zorro2RTG: USB input from the real board over the bridge\n"));
-            }
-        }
-    }
+    d->api->configured(d->b, address, zb_now());
 }
 
-static void z2rtg_refresh(void *userdata)
+static void zb_refresh(void *userdata)
 {
-    static_cast<z2rtg_state *>(userdata)->mode_changed = true;
+    static_cast<zb_state *>(userdata)->mode_changed = true;
 }
 
-static void z2rtg_reset(void *userdata)
+static void zb_reset(void *userdata)
 {
-    auto *d = static_cast<z2rtg_state *>(userdata);
-    d->core.reset();
-    if (d->rtg_on) {
-        d->rtg_on = false;
-        gfxboard_set(d->monitor_id, false);
-    }
+    auto *d = static_cast<zb_state *>(userdata);
+    d->api->reset_board(d->b);
 }
 
-static void z2rtg_free(void *userdata)
+static void zb_free(void *userdata)
 {
-    auto *d = static_cast<z2rtg_state *>(userdata);
+    auto *d = static_cast<zb_state *>(userdata);
     if (!d)
         return;
     if (d->devnum >= 0 && d->devnum < MAX_RTG_BOARDS)
-        z2rtg_boards[d->devnum] = nullptr;
-    d->link.close();
-    if (d->in_fd >= 0)
-        close(d->in_fd);
+        zb_boards[d->devnum] = nullptr;
+    if (d->b)
+        d->api->destroy(d->b);
     delete d;
 }
 
-static bool z2rtg_init(autoconfig_info *aci)
+static bool zb_init(autoconfig_info *aci)
 {
-    aci->label = _T("Zorro2RTG");
+    const zbp_api *api = zbp_get_api(ZBP_VERSION);
+    if (!api || api->struct_size < sizeof(zbp_api)) {
+        write_log(_T("zboard: plugin does not offer interface version %d\n"), ZBP_VERSION);
+        return false;
+    }
+    aci->label = api->desc->name;
     if (!aci->doinit)
         return true;
-    auto *d = new (std::nothrow) z2rtg_state{};
+    auto *d = new (std::nothrow) zb_state{};
     if (!d)
         return false;
+    d->api = api;
+    d->size = api->desc->size;
     d->devnum = aci->devnum;
     d->monitor_id = aci->prefs->rtgboards[aci->devnum].monitor_id;
-    if (const char *t = getenv("Z2RTG_TRACE"))
-        d->trace = atoi(t);
-    if (const char *t = getenv("Z2RTG_BUS"); t && !atoi(t))
-        z2_bus_write = z2_bus_read = 0;
-    if (const char *t = getenv("Z2RTG_NOCURSOR"))
-        d->no_cursor = atoi(t) != 0;
-    if (const char *t = getenv("Z2RTG_TRACE_BLT"))
-        d->trace_blt = atoi(t);
-    if (const char *f = getenv("Z2RTG_TRACE_FILE"))
-        d->tf = fopen(f, "w");
-    if (const char *f = getenv("Z2RTG_BOOTROM")) {
-        if (FILE *rf = fopen(f, "rb")) {
-            d->core.rom.resize(Z2R_BOOTROM_SIZE);
-            d->core.rom.resize(fread(d->core.rom.data(), 1, Z2R_BOOTROM_SIZE, rf));
-            fclose(rf);
-            write_log(_T("Zorro2RTG: boot ROM %s, %u bytes\n"), f, static_cast<unsigned>(d->core.rom.size()));
-        } else {
-            write_log(_T("Zorro2RTG: boot ROM %s not found\n"), f);
-        }
+    d->host.struct_size = sizeof d->host;
+    d->host.charge_ns = zb_charge;
+    d->host.display = zb_display;
+    d->host.log = zb_log;
+    d->b = api->create(&d->host, d, "");   // options: the plugin's environment variables for now
+    if (!d->b) {
+        delete d;
+        return false;
     }
-    z2rtg_boards[d->devnum] = d;
-    aci->addrbank = &z2rtg_bank;
+    zb_boards[d->devnum] = d;
+    aci->addrbank = &zb_io_bank;
     aci->userdata = d;
     return true;
 }
 
 gfxboard_func zorro2rtg_func = {
-    z2rtg_init,
-    z2rtg_free,
-    z2rtg_reset,
-    z2rtg_hsync,
-    z2rtg_vsync,
-    z2rtg_refresh,
-    z2rtg_toggle,
-    z2rtg_configured
+    zb_init,
+    zb_free,
+    zb_reset,
+    zb_hsync,
+    zb_vsync,
+    zb_refresh,
+    zb_toggle,
+    zb_configured
 };

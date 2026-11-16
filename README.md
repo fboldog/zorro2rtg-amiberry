@@ -21,7 +21,9 @@ Licence: GPL-3.0-or-later (`LICENSE`).
 
 | Path | What it is |
 |---|---|
-| `src/zorro2rtg.cpp` | Glue to Amiberry's `gfxboard_func`: memory banks, display, hsync, interrupts, environment options |
+| `include/zboard_plugin.h` | The plugin interface: a Zorro board behind a versioned C interface that names no emulator type |
+| `src/z2rtg_plugin.cpp` | The Zorro2RTG board as that plugin: the model, its timing and bus time, the link, USB input, boot ROM, traces and finished frames; its options |
+| `src/zorro2rtg.cpp` | Amiberry's adapter, using only the plugin interface: memory banks, CPU time and stalls, /INT2, display switching, frame copy |
 | `src/z2rtg_core.{h,cpp}` | The board model, independent of any emulator |
 | `src/z2rtg_capi.cpp` | C interface to the model, for host tests |
 | `src/z2rtg_link.{h,cpp}` | Board-in-the-loop link: the model's write stream to a real board, over its serial port or a Unix socket |
@@ -29,7 +31,19 @@ Licence: GPL-3.0-or-later (`LICENSE`).
 | `integrate.py` | Copies the board into an Amiberry v8.5.0 tree and makes the small table edits (safe to run again) |
 | `build.sh` | Clones v8.5.0 if needed, integrates, builds with CMake and Ninja |
 
-Amiberry has no plugin interface for expansion boards, so the board is compiled in, like its other gfxboards.
+## The plugin interface
+
+`include/zboard_plugin.h` (version 1) is the only interface between the board and the emulator. One function,
+`zbp_get_api(version)`, returns the board's description (Autoconfig bytes and memory regions) and its calls:
+create and destroy, `configured`, `reset_board`, 8- and 16-bit `read` and `write`, a direct pointer into its RAM
+regions, `tick` (timing and side channels; returns the interrupt levels it requests) and `frame` (the finished
+picture). The host passes its emulated time in ns with every call and supplies three callbacks: charge bus
+time, switch the display, log. Version 1 is Zorro II only and has no save states, since a board in the loop
+depends on the real board's state.
+
+Amiberry has no loader for expansion boards, so the board is compiled in, like its other gfxboards, and
+`integrate.py` adds its Autoconfig row to `gfxboard.cpp`, which must match the plugin's description. A loader
+that builds the row from the description is an Amiberry change for later.
 
 ## Build
 
@@ -49,6 +63,7 @@ list). It is a 4 MB Zorro II board.
 | `Z2RTG_INPUT` | `FIFO`: single-wire link frames from a named pipe. `bridge`: events from the real board's USB input queue |
 | `Z2RTG_BOOTROM` | The boot ROM image for the BOOTROM window |
 | `Z2RTG_BUS=0` | No Zorro II bus time charged per access |
+| | Each variable `Z2RTG_<KEY>` is also the plugin option `key=value` (create's option string, which the Amiberry adapter leaves empty for now) |
 | `Z2RTG_TRACE`, `Z2RTG_TRACE_BLT`, `Z2RTG_TRACE_TPL`, `Z2RTG_TRACE_FILE`, `Z2RTG_NOCURSOR` | Debugging |
 
 ## The link's socket
@@ -78,5 +93,6 @@ Reads are always answered by the emulated board and never forwarded, since a USB
 
 The host tests live in the main project (`make -C sim host`):
 - `sw/tests/test_z2rtg_core.py`: the model;
+- `sw/tests/test_zboard_plugin.py`: the board through the plugin interface, as a host uses it;
 - `sw/tests/test_z2rtg_link.py`: input polling during a long redraw;
 - `sw/tests/test_z2bridged.py`: the link through the daemon, together with a second client.

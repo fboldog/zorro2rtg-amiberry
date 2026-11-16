@@ -34,9 +34,9 @@ def replace(path, old, new):
 
 def main():
     src = pathlib.Path(sys.argv[1]).resolve()
-    for f in ("zorro2rtg.cpp", "z2rtg_core.cpp", "z2rtg_link.cpp"):
+    for f in ("zorro2rtg.cpp", "z2rtg_plugin.cpp", "z2rtg_core.cpp", "z2rtg_link.cpp"):
         shutil.copy(HERE / "src" / f, src / "src" / f)
-    for f in ("src/z2rtg_core.h", "src/z2rtg_link.h", "include/zorro2rtg_regs.h"):
+    for f in ("src/z2rtg_core.h", "src/z2rtg_link.h", "include/zorro2rtg_regs.h", "include/zboard_plugin.h"):
         shutil.copy(HERE / f, src / "src" / "include" / pathlib.Path(f).name)
     h = src / "src/include/gfxboard.h"
     edit(h, "#define GFXBOARD_ID_ZZ9000_Z3 44\n", "#define GFXBOARD_ID_ZORRO2RTG 45\n")
@@ -62,6 +62,7 @@ def main():
     c = src / "cmake/SourceFiles.cmake"
     edit(c, "        src/zz9000.cpp\n", "        src/zorro2rtg.cpp\n        src/z2rtg_core.cpp\n")
     edit(c, "        src/z2rtg_core.cpp\n", "        src/z2rtg_link.cpp\n")
+    edit(c, "        src/z2rtg_link.cpp\n", "        src/z2rtg_plugin.cpp\n")
 
 
 if __name__ == "__main__":
