@@ -22,6 +22,13 @@
 //     which carries the same protocol and shares the board with other programs (README.md). A socket the
 //     daemon closes counts as a lost port. Replies through the daemon are waited for up to 10 minutes,
 //     since it holds this link's commands while a host tool holds the board (the emulation stalls then).
+//     A refused command is answered with a lone 'e' there too, also where a read's data should be, so a
+//     read is never waited for past it (reply()).
+//   - The queue is bounded (MAX_QUEUE writes waiting, about 6 MB): once it is full, write() waits for the
+//     worker, so a link that cannot keep up (a host tool holding the board, a slow port) slows the emulated
+//     board down instead of growing the queue without limit.
+//   - close() lets the worker finish what is queued for up to CLOSE_MS, then gives up on replies still
+//     outstanding, so a daemon that never answers cannot hold up the emulator's shutdown.
 // SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef Z2RTG_LINK_H
 #define Z2RTG_LINK_H
@@ -51,8 +58,12 @@ public:
     bool take_event(std::array<uint8_t, 7> &ev);       // the next event read from it, if any
     void close();
 
+    static constexpr size_t MAX_QUEUE = size_t(1) << 19;   // writes waiting for the worker
+    static constexpr int CLOSE_MS = 2000;                  // close(): time left for the queue and its replies
+
     // statistics (read without the lock: approximate)
     uint64_t words = 0, bursts = 0, polls = 0, errors = 0, resent = 0, events = 0, in_overflows = 0, in_frame_errs = 0;
+    uint64_t full_waits = 0;                               // write() calls that waited for room in the queue
     size_t queue_max = 0;
 
 private:
@@ -65,17 +76,23 @@ private:
     std::thread th;
     std::mutex mx;
     std::condition_variable cv;
+    std::condition_variable room;                // the worker took the queue (write() waits on a full one)
     std::deque<Item> q;
     bool stop = false;
     std::atomic<bool> input {false};
     std::deque<std::array<uint8_t, 7>> evq;      // events from the real board, under mx
     std::deque<std::vector<uint8_t>> inflight;   // bursts sent and not yet acknowledged, oldest first
+    // close(): from this steady_clock time on, no reply is waited for (0: not closing)
+    std::atomic<int64_t> quit_at {0};
+    bool quitting() const;
 
     void run();
     void port_lost(const char *what);
     void flush_input();
     bool send(const uint8_t *p, size_t n);
     int recv(uint8_t *p, size_t n, int timeout_ms);
+    int recv_raw(uint8_t *p, size_t n, int timeout_ms);
+    int reply(uint8_t *p, size_t n, int timeout_ms);   // a command's reply: n bytes, or 1 ('e') if refused
     bool ack();
     bool drain();
     bool recover();

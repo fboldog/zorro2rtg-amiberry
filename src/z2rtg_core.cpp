@@ -121,6 +121,29 @@ void Z2rtgCore::write8(uint32_t offset, uint8_t value)
     write16(offset & ~1u, w, offset & 1 ? 1 : 2);
 }
 
+uint16_t Z2rtgCore::write_base(uint32_t offset)
+{
+    const uint32_t o = offset & 0x3FFFFE;
+    if (o >= Z2R_VRAM_START)
+        return read16(o);
+    if (o >= Z2R_PALETTE_START && o < Z2R_PALETTE_START + Z2R_PALETTE_SIZE && !(o & 2))
+        return pal_hi_st;
+    switch (o) {
+    case Z2R_REG_SCAN_BASE_HI:   return scan_base_hi_st;
+    case Z2R_REG_CURSOR_COL1_HI: return cursor_col_hi_st[0];
+    case Z2R_REG_CURSOR_COL2_HI: return cursor_col_hi_st[1];
+    case Z2R_REG_CURSOR_COL3_HI: return cursor_col_hi_st[2];
+    case Z2R_REG_BLT_DST_HI:     return dst_hi_st;
+    case Z2R_REG_BLT_SRC_HI:     return src_hi_st;
+    case Z2R_REG_BLT_FG_HI:      return fg_hi_st;
+    case Z2R_REG_BLT_BG_HI:      return bg_hi_st;
+    case Z2R_REG_STATUS: case Z2R_REG_IN_STATUS: case Z2R_REG_IN_POP: case Z2R_REG_BLT_OP:
+        return 0;
+    default:
+        return read16(o);
+    }
+}
+
 // ------------------------------------------------------------------ registers
 uint16_t Z2rtgCore::read_reg(uint32_t o)
 {
@@ -393,9 +416,15 @@ void Z2rtgCore::blit(unsigned op)
                 }
             }
     } else {
-        // COPY reads the whole source first (memmove semantics; the gateware needs REVERSE for that)
+        // COPY reads the whole source first (memmove semantics; the gateware needs REVERSE for that). The
+        // rectangle is copied out, or, when it is larger than an eighth of the SDRAM, the whole SDRAM is: its
+        // addresses wrap, so that snapshot holds every source byte, and no job needs more than VRAM_BYTES
+        // (a rectangle at the register limits would otherwise ask for up to 16 GiB)
         std::vector<uint8_t> src;
-        if (op == Z2R_BLITTER_OP_COPY) {
+        const bool whole = op == Z2R_BLITTER_OP_COPY && static_cast<uint64_t>(rb) * h > VRAM_BYTES / 8;
+        if (whole) {
+            src = vram;
+        } else if (op == Z2R_BLITTER_OP_COPY) {
             src.resize(static_cast<size_t>(rb) * h);
             for (uint32_t y = 0; y < h; y++)
                 for (uint32_t x = 0; x < rb; x++)
@@ -406,7 +435,8 @@ void Z2rtgCore::blit(unsigned op)
         for (uint32_t y = 0; y < h; y++)
             for (uint32_t x = 0; x < rb; x++) {
                 uint32_t a = blt_dst + y * ds + x;
-                uint8_t s = op == Z2R_BLITTER_OP_COPY ? src[static_cast<size_t>(y) * rb + x]
+                uint8_t s = whole ? src[(blt_src + y * ss + x) & SDRAM_MASK]
+                          : op == Z2R_BLITTER_OP_COPY ? src[static_cast<size_t>(y) * rb + x]
                                                       : static_cast<uint8_t>(fgr >> (8 * (3 - (a & 3))));
                 uint8_t &d = at(a);
                 d = rop8(rop, s, d);

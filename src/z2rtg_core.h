@@ -76,6 +76,11 @@ struct Z2rtgCore {
     void write16(uint32_t offset, uint16_t value, unsigned be = 3);
     uint8_t read8(uint32_t offset);
     void write8(uint32_t offset, uint8_t value);
+    // the word a register's write side holds, which a byte write merges into: the staging value for the
+    // _HI halves and the palette's high words (not what they read back), 0 for the write-1-to-clear,
+    // pop and start registers, else what the register reads. A word write of this value after a byte
+    // write repeats that byte write exactly (the bridge writes whole words)
+    uint16_t write_base(uint32_t offset);
 
     // board offset in the VRAM or staging window to an SDRAM address (BANK applies)
     uint32_t sdram_addr(uint32_t offset) const { return (bank & 1u) * 0x400000u + offset; }

@@ -157,6 +157,7 @@ void zbp_board::advance(uint64_t now)
     if (!have_time || now < last_ns || now - last_ns > RESYNC_NS) {
         have_time = true;                   // first call, or a jump (reset, state load): resync
         last_ns = now;
+        next_poll = now;                    // after a rewind, the old deadline would hold the input back
         core.blt_busy_until = 0;
         return;
     }
@@ -242,7 +243,7 @@ void zbp_board::link_vram(uint32_t off)
 
 // ---- the interface
 
-static zbp_board *p_create(const zbp_host *host, void *host_ctx, const char *options)
+static zbp_board *do_create(const zbp_host *host, void *host_ctx, const char *options)
 {
     if (!host || host->struct_size < sizeof(zbp_host))
         return nullptr;
@@ -301,7 +302,7 @@ static void p_destroy(zbp_board *b)
     delete b;
 }
 
-static void p_configured(zbp_board *b, uint32_t base, uint64_t now_ns)
+static void do_configured(zbp_board *b, uint32_t base, uint64_t now_ns)
 {
     b->configured = true;
     b->have_time = true;
@@ -329,7 +330,7 @@ static void p_configured(zbp_board *b, uint32_t base, uint64_t now_ns)
     }
 }
 
-static void p_reset_board(zbp_board *b)
+static void do_reset_board(zbp_board *b)
 {
     b->core.reset();
     if (b->rtg_on) {
@@ -350,7 +351,7 @@ static uint32_t p_read(zbp_board *b, uint32_t off, int bytes, uint64_t now_ns)
     return bytes == 1 ? b->core.read8(off) : b->core.read16(off);
 }
 
-static void p_write(zbp_board *b, uint32_t off, uint32_t v, int bytes, uint64_t now_ns)
+static void do_write(zbp_board *b, uint32_t off, uint32_t v, int bytes, uint64_t now_ns)
 {
     off &= BOARD_SIZE - 1;
     if (b->configured)
@@ -372,9 +373,9 @@ static void p_write(zbp_board *b, uint32_t off, uint32_t v, int bytes, uint64_t 
         return;
     }
     b->core.write8(off, static_cast<uint8_t>(v));
-    // the bridge writes whole words: the byte in its lane, the other lane as the model now reads it
-    // (STATUS: 0, so no other W1C bit is cleared)
-    uint16_t w = (off & ~1u) == Z2R_REG_STATUS ? 0 : b->core.read16(off & ~1u);
+    // the bridge writes whole words: the byte in its lane, the other lane as the register's write side now
+    // holds it (write_base: a _HI half's staging value, not its committed one; 0 for the W1C registers)
+    uint16_t w = b->core.write_base(off & ~1u);
     w = (off & 1) ? static_cast<uint16_t>((w & 0xFF00) | (v & 0xFF)) : static_cast<uint16_t>((w & 0x00FF) | ((v & 0xFF) << 8));
     b->link_reg(off & ~1u, w, jobs, bbytes);
 }
@@ -386,11 +387,13 @@ static const uint8_t *p_ptr(zbp_board *b, uint32_t off, uint32_t len)
     return &b->core.vram[b->core.sdram_addr(off) & (Z2rtgCore::VRAM_BYTES - 1)];
 }
 
-static uint32_t p_tick(zbp_board *b, uint64_t now_ns)
+static uint32_t do_tick(zbp_board *b, uint64_t now_ns)
 {
     if (!b->configured)
         return 0;
     b->advance(now_ns);
+    if (b->next_poll > now_ns + POLL_NS)    // time went back a little, short of a resync
+        b->next_poll = now_ns;
     if (now_ns >= b->next_poll) {
         b->next_poll = now_ns + POLL_NS;
         if (b->in_fd >= 0) {
@@ -412,7 +415,7 @@ static uint32_t p_tick(zbp_board *b, uint64_t now_ns)
     return b->core.int_req() ? 1u << 2 : 0;
 }
 
-static int p_frame(zbp_board *b, zbp_frame *f)
+static int do_frame(zbp_board *b, zbp_frame *f)
 {
     if (!b->configured || !f || f->struct_size < sizeof(zbp_frame))
         return 0;
@@ -421,21 +424,34 @@ static int p_frame(zbp_board *b, zbp_frame *f)
     const size_t line_size = static_cast<size_t>(W) * 2;
     b->fb.resize(line_size * H);
     const bool show = c.showing();
+    const bool clut = c.format_act == Z2R_PIXEL_FORMAT_CLUT8;
     const uint32_t base = c.scan_base_act & ~31u, stride = c.stride_act & ~31u;
+    constexpr uint32_t MASK = Z2rtgCore::VRAM_BYTES - 1;
+    const uint8_t *vram = c.vram.data();
+    uint8_t lut[256][2];                        // CLUT8: the palette (8:8:8 on the board) reduced to RGB565
+    if (show && clut)
+        for (int i = 0; i < 256; i++) {
+            const uint16_t p = rgb565(c.palette[i]);
+            lut[i][0] = static_cast<uint8_t>(p >> 8);
+            lut[i][1] = static_cast<uint8_t>(p);
+        }
     for (int y = 0; y < H; y++) {
         uint8_t *line = &b->fb[y * line_size];
-        if (show && c.format_act == Z2R_PIXEL_FORMAT_CLUT8)
-            // a byte per pixel through the palette (8:8:8 on the board), reduced to RGB565
-            for (int x = 0; x < W; x++) {
-                const uint16_t p = rgb565(c.palette[c.vram[(base + y * stride + x) & (Z2rtgCore::VRAM_BYTES - 1)]]);
-                line[2 * x] = static_cast<uint8_t>(p >> 8);
-                line[2 * x + 1] = static_cast<uint8_t>(p);
-            }
-        else if (show)
-            for (size_t i = 0; i < line_size; i++)
-                line[i] = c.vram[(base + y * stride + i) & (Z2rtgCore::VRAM_BYTES - 1)];
-        else
+        const uint32_t a = (base + y * stride) & MASK;
+        if (show && clut) {
+            // a byte per pixel; a line that runs past the end of the SDRAM continues at its start
+            const uint32_t first = std::min<uint32_t>(W, Z2rtgCore::VRAM_BYTES - a);
+            for (uint32_t x = 0; x < first; x++)
+                memcpy(line + 2 * x, lut[vram[a + x]], 2);
+            for (uint32_t x = first; x < static_cast<uint32_t>(W); x++)
+                memcpy(line + 2 * x, lut[vram[x - first]], 2);
+        } else if (show) {
+            const size_t first = std::min<size_t>(line_size, Z2rtgCore::VRAM_BYTES - a);
+            memcpy(line, vram + a, first);
+            memcpy(line + first, vram, line_size - first);
+        } else {
             memset(line, 0, line_size);
+        }
         // the hardware cursor over the line, reduced to RGB565
         if (show && c.cursor_en_act && !b->no_cursor && y >= c.cursor_y_act && y < c.cursor_y_act + 64)
             for (int x = std::max(0, static_cast<int>(c.cursor_x_act)); x < std::min(W, c.cursor_x_act + 64); x++) {
@@ -457,6 +473,52 @@ static int p_frame(zbp_board *b, zbp_frame *f)
     b->last_h = H;
     b->last_format = f->format;
     return 1;
+}
+
+// The C interface lets no exception out (zboard_plugin.h, "Conventions"). The model allocates (a COPY's
+// source, the frame, the input queues, the link's thread), so each call that can catches everything: the
+// access or frame is lost and logged, the emulator goes on.
+static void caught(zbp_board *b, const char *where)
+{
+    if (b && b->host && b->host->log) {
+        char m[160];
+        snprintf(m, sizeof m, "Zorro2RTG: %s failed (out of memory or another C++ exception); ignored", where);
+        b->host->log(b->ctx, ZBP_LOG_WARN, m);
+    }
+}
+
+static zbp_board *p_create(const zbp_host *host, void *host_ctx, const char *options)
+{
+    try {
+        return do_create(host, host_ctx, options);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static void p_configured(zbp_board *b, uint32_t base, uint64_t now_ns)
+{
+    try { do_configured(b, base, now_ns); } catch (...) { caught(b, "configured"); }
+}
+
+static void p_reset_board(zbp_board *b)
+{
+    try { do_reset_board(b); } catch (...) { caught(b, "reset_board"); }
+}
+
+static void p_write(zbp_board *b, uint32_t off, uint32_t v, int bytes, uint64_t now_ns)
+{
+    try { do_write(b, off, v, bytes, now_ns); } catch (...) { caught(b, "write"); }
+}
+
+static uint32_t p_tick(zbp_board *b, uint64_t now_ns)
+{
+    try { return do_tick(b, now_ns); } catch (...) { caught(b, "tick"); return 0; }
+}
+
+static int p_frame(zbp_board *b, zbp_frame *f)
+{
+    try { return do_frame(b, f); } catch (...) { caught(b, "frame"); return 0; }
 }
 
 static const zbp_api api = {
