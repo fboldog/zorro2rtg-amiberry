@@ -8,6 +8,9 @@ the loop that talks to the real Nano 20K over its UART debug bridge (docs/debug_
   whole redraw. Both limits sit a little above the daemon's UART window (WINDOW_BYTES, WINDOW_CMDS), which
   keeps many short commands in flight, so 1-word bursts (a vertical line drawn by the CPU, as in a window
   outline) are not bound by the USB round trip.
+- Pointer ('P'): the latest position is kept and sent as one 2-word burst to CURSOR_X ahead of the writes
+  still queued here (also while an input poll runs; not during a barrier, since a job holds the bridge's
+  writes back and its receive FIFO is 64 bytes), so the real pointer keeps up while the board is busy.
 - Barrier ('B'): nothing after it goes out until every earlier burst is acknowledged and the real STATUS
   reads BLT_BUSY clear (up to BLIT_POLLS reads).
 - Input ('I'): every INPUT_EVERY the peer reads IN_STATUS..IN_EV3 in one burst read; an event found is sent
@@ -35,6 +38,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 REGS = {k: int(v, 16) for k, v in re.findall(r"#define Z2R_(\w+) 0x([0-9A-Fa-f]+)U?",
                                             (HERE / "zorro2rtg_regs.h").read_text())}
 STATUS, BLT_BUSY, BLT_OP = REGS["REG_STATUS"], REGS["STATUS_BLT_BUSY"], REGS["REG_BLT_OP"]
+CURSOR_X = REGS["REG_CURSOR_X"]       # CURSOR_Y follows it
 IN_STATUS, IN_POP, IN_POP_POP = REGS["REG_IN_STATUS"], REGS["REG_IN_POP"], REGS["IN_POP_POP"]
 IN_AVAIL, IN_OVF, IN_FERR = REGS["IN_STATUS_AVAIL"], REGS["IN_STATUS_OVERFLOW"], REGS["IN_STATUS_FRAME_ERR"]
 
@@ -57,6 +61,7 @@ class Peer:
         self.api = api
         self.q = collections.deque()      # [b'W', offset, data] (data: big-endian words still to send), [b'B'],
                                           # or [b'M', epoch]: the end of a message
+        self.pointer = None               # CURSOR_X and CURSOR_Y not sent yet ('P'), 4 bytes
         self.epoch = None                 # the plugin's stream ('Z')
         self.done = self.done_sent = 0    # its messages passed to the daemon, and the count last sent ('A')
         self.backlog_words = 0
@@ -92,6 +97,11 @@ class Peer:
             elif k == b"B":
                 self.q.append([b"B"])
                 i += 1
+            elif k == b"P":
+                if n - i < 5:
+                    raise ValueError("a P record cut short")
+                self.pointer = bytes(msg[i + 1:i + 5])
+                i += 5
             elif k == b"Z":
                 if n - i < 2:
                     raise ValueError("a Z record cut short")
@@ -111,7 +121,7 @@ class Peer:
         return self.backlog_words
 
     def busy(self):
-        return bool(self.q or self.sent or self.failed or self.barrier or self.in_busy)
+        return bool(self.q or self.sent or self.failed or self.barrier or self.in_busy or self.pointer is not None)
 
     def poll(self, now):
         self.report(now)
@@ -143,6 +153,8 @@ class Peer:
             self.barrier, self.polls_left = "poll", BLIT_POLLS
             self.stats["polls"] += 1
             self.api.submit(b"R" + a3(STATUS), 2, self.status_reply)
+        if self.pointer is not None and not self.barrier:
+            self.send_pointer()
         if self.barrier or self.in_busy:
             return                        # an input poll takes the whole queue before more writes go out
         while self.q and self.api.outstanding_bytes() < OUT_BYTES and self.api.outstanding() < OUT_CMDS:
@@ -165,6 +177,15 @@ class Peer:
                 item[1], item[2] = off + 2 * n, data[2 * n:]
             else:
                 self.q.popleft()
+
+    def send_pointer(self):
+        data, self.pointer = self.pointer, None
+        self.stats["pointer"] += 1
+
+        def reply(r):
+            if r != b"k" and self.pointer is None:
+                self.pointer = data       # refused: again, unless a newer position came meanwhile
+        self.api.submit(b"B" + a3(CURSOR_X) + bytes([1]) + data, 1, reply)
 
     def acknowledge(self):
         if self.epoch is not None and self.done != self.done_sent:
@@ -250,7 +271,7 @@ class Peer:
         self.reported = snap
         s = self.stats
         line = (f"{s['words']} words in {s['bursts']} bursts, {s['polls']} blitter waits, {s['errors']} errors, "
-                f"{s['resent']} bursts resent, {self.backlog_words} words waiting")
+                f"{s['resent']} bursts resent, {s['pointer']} pointer moves, {self.backlog_words} words waiting")
         if self.input:
             line += (f"; input {s['events']} events, {s['overflows']} overflows, {s['frame_errors']} frame errors, "
                      f"{s['input_errors']} refused reads, {s['in_polls']} polls")

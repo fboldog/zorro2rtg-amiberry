@@ -14,6 +14,7 @@ void Z2rtgLink::start(SendFn send, ReadFn read, bool in)
 {
     q.clear();
     msg.clear();
+    ptr_new = false;
     dirty.assign((VRAM_WORDS + 63) / 64, 0);
     groups.clear();
     out = std::move(send);
@@ -33,6 +34,7 @@ void Z2rtgLink::stop()
     out = nullptr;
     rd = nullptr;
     input = false;
+    ptr_new = false;
     q.clear();
     msg.clear();
     groups.clear();
@@ -54,6 +56,11 @@ void Z2rtgLink::write(uint32_t offset, uint16_t value)
     }
     if (input && offset >= Z2R_REG_IN_STATUS && offset <= Z2R_REG_IN_POP)
         return;                                  // the real queue belongs to the peer (input on)
+    if (offset == Z2R_REG_CURSOR_X || offset == Z2R_REG_CURSOR_Y) {
+        (offset == Z2R_REG_CURSOR_X ? ptr_x : ptr_y) = value;   // the fast lane: the latest position only
+        ptr_new = true;
+        return;
+    }
     q.push_back({offset, value, false});
     if (q.size() >= FLUSH_AT)
         flush();
@@ -79,7 +86,7 @@ void Z2rtgLink::send_msg()
 
 void Z2rtgLink::put(uint8_t rec)
 {
-    if (msg.size() + 2 > MSG_MAX)
+    if (msg.size() + 5 > MSG_MAX)
         send_msg();
     msg.push_back(rec);
 }
@@ -142,6 +149,12 @@ void Z2rtgLink::flush(bool force)
 {
     if (!out)
         return;
+    if (ptr_new) {
+        put('P');
+        msg.insert(msg.end(), {static_cast<uint8_t>(ptr_x >> 8), static_cast<uint8_t>(ptr_x),
+                               static_cast<uint8_t>(ptr_y >> 8), static_cast<uint8_t>(ptr_y)});
+        ptr_new = false;
+    }
     std::vector<uint16_t> regs;
     for (size_t i = 0; i < q.size() && out;) {
         if (q[i].wait) {

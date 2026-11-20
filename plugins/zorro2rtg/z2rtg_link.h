@@ -15,6 +15,10 @@
 //     regardless: the model's blitter finishes at once, so the values after it would already hold the
 //     job's result, and BANK changes what an offset means. Registers go before the changed VRAM in a
 //     flush, so a job started earlier runs before the writes that follow it.
+//   - The pointer's position (CURSOR_X, CURSOR_Y) is not queued: only its latest value matters and it only
+//     changes what the monitor shows, so each message carries it as one 'P' record, which the peer sends
+//     ahead of the drawing it still has queued. The pointer on the real monitor then keeps up while the
+//     real board is busy drawing (a directory listing scrolling).
 //   - wait_blitter() puts a barrier in the stream: the peer polls the real STATUS until BLT_BUSY clears
 //     before it sends anything after it. The emulated CPU waits on the model's BLT_BUSY, which the real
 //     board never sees, so a long job would otherwise still be running when the next writes arrive.
@@ -28,6 +32,7 @@
 //   'W' a2 a1 a0 nH nL  then n big-endian words     n consecutive words from board offset a (n <= RUN_MAX)
 //   'B'                                             blitter barrier
 //   'I'                                             poll the real board's input queue from now on
+//   'P' xH xL yH yL                                 the pointer's position now (CURSOR_X, CURSOR_Y)
 // peer -> plugin: one record per message
 //   'E' t p0 p1 p2 p3 p4 p5                         an input event (IN_EV0-3: type, then six bytes)
 //   'A' e n3 n2 n1 n0                               n messages of epoch e passed to the bridge so far
@@ -71,6 +76,8 @@ private:
     ReadFn rd;
     bool input = false;
     uint8_t epoch = 0;
+    uint16_t ptr_x = 0, ptr_y = 0;                     // CURSOR_X and CURSOR_Y, latest
+    bool ptr_new = false;                              // not sent yet
     uint32_t sent = 0, acked = 0;                      // messages of this epoch
     std::vector<Item> q;                               // registers and barriers, in order
     std::vector<uint64_t> dirty;                       // one bit per VRAM word

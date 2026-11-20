@@ -50,6 +50,7 @@ Messages, plugin to peer: a sequence of records, up to 32 KB a message.
 | Write run | `W a2 a1 a0 nH nL` + n big-endian words | n consecutive words from board offset a (n up to 4096) |
 | Barrier | `B` | the real `BLT_BUSY` must clear before what follows |
 | Input | `I` | poll the real board's USB input queue from now on |
+| Pointer | `P xH xL yH yL` | the pointer's position now (`CURSOR_X`, `CURSOR_Y`); the peer sends it ahead of the drawing it still has queued |
 
 Peer to plugin, one record per message:
 
@@ -66,6 +67,10 @@ Amiga never waits, and the real board skips the intermediate pictures but ends e
 or a `BANK` write reaches the model, every changed word goes out regardless, with its value from before,
 since the model's blitter finishes at once. The plugin puts a barrier after a blitter job of 16 KB or 64 rows
 or more, and keeps `IN_*` writes local while input comes from the real board.
+
+The pointer's position is not queued with the other registers: each message carries its latest value as
+one `P` record, and the peer sends it ahead of the writes it still has queued (not during a blitter wait),
+so the real pointer keeps up while the real board is still drawing a listing or a drag.
 
 The peer (`peer.py`) turns runs into bridge bursts of 256 words, acknowledges each message once its last
 record has gone to the daemon, waits at a barrier for the real `BLT_BUSY`, polls the input queue every 5 ms
