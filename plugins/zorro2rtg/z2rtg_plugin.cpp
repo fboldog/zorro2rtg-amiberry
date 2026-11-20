@@ -1,6 +1,7 @@
 // Zorro2RTG as a zboard plugin (include/zboard_plugin.h): the board model (z2rtg_core), its timing, the
-// board-in-the-loop link (z2rtg_link), the USB input sources, the boot ROM, the traces and the finished
-// frame. Emulator-independent; hosts/amiberry/zboard_amiberry.cpp is Amiberry's adapter to it.
+// board-in-the-loop write stream (z2rtg_link, through the host's channel to the peer in peer.py), the USB
+// input sources, the boot ROM, the traces and the finished frame. Emulator-independent;
+// hosts/amiberry/zboard_amiberry.cpp is Amiberry's adapter to it.
 //
 // Time: the model's 64 us lines (blitter busy time, vertical blank, FRAME_COUNT) follow the host's time,
 // passed with every call, so BLT_BUSY resolves to the CPU cycle inside a line.
@@ -9,10 +10,10 @@
 // the A2000 (z2test BENCH); bus=0 turns the charge off.
 //
 // Options (create's string, else the environment variable Z2RTG_<KEY>):
-//   bridge=DEV        mirror every write to a real board: /dev/ttyUSBn, or unix:PATH / a socket path for
-//                     z2bridged.py (README.md)
-//   bridge_baud=N     serial port only, default 3000000
 //   input=FIFO|bridge USB input from single-wire link frames in a named pipe, or from the real board's queue
+//                     (board in the loop: the host's channel to the peer must be open)
+// Board in the loop needs no option here: when the host opens the channel to this board's peer (the user
+// asked it for the daemon), every write goes to the real board through it.
 //   bootrom=FILE      the boot ROM image for the BOOTROM window (default: none, the window reads 0)
 //   bus=0             no bus time charged
 //   trace=N, trace_blt=N, trace_tpl=1, trace_file=FILE, nocursor=1   debugging
@@ -23,7 +24,10 @@
 #include "zorro2rtg_regs.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstddef>
+#include <deque>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -62,7 +66,12 @@ const zbp_desc desc = {
     1, 0x8000,          // serial, the DiagArea in the boot ROM
     BOARD_SIZE, 2, ZBP_DESC_DISPLAY | ZBP_DESC_NOT_RAM,
     sizeof(regions) / sizeof(regions[0]), regions,
+    "zorro2rtg",        // the peer in the daemon: plugins/zorro2rtg/peer.py
 };
+
+// the host's channel fields, present when its zbp_host is new enough
+constexpr size_t HOST_V1 = offsetof(zbp_host, log) + sizeof(void *);
+constexpr size_t HOST_CHANNEL = offsetof(zbp_host, recv) + sizeof(void *);
 
 uint16_t rgb565(uint32_t c)
 {
@@ -86,6 +95,8 @@ struct zbp_board {
     uint32_t bus_write = BUS_WRITE_NS, bus_read = BUS_READ_NS;
     int in_fd = -1;                  // input=FIFO
     bool in_bridge = false;          // input=bridge
+    std::deque<std::array<uint8_t, 7>> in_wait;   // events from the peer the emulated queue had no room for
+    std::vector<uint8_t> rx;         // a message from the peer
 
     std::vector<uint8_t> fb;
     int last_w = 0, last_h = 0;
@@ -131,7 +142,8 @@ struct zbp_board {
         if (ns && host->charge_ns)
             host->charge_ns(ctx, ns);
     }
-    FILE *link_log() const { return tf ? tf : stderr; }
+    bool has_channel() const { return host->struct_size >= HOST_CHANNEL && host->channel_up && host->send && host->recv; }
+    bool channel_up() const { return has_channel() && host->channel_up(ctx); }
 
     void follow_video_en();
     void advance(uint64_t now);
@@ -226,7 +238,7 @@ void zbp_board::do_trace(uint32_t off, uint32_t v, int size)
 
 void zbp_board::link_reg(uint32_t off, uint16_t v, uint32_t jobs_before, uint32_t bytes_before)
 {
-    if (!link.is_open())
+    if (!link.active())
         return;
     link.write(off, v);
     // a job the model started: wait for the real one when it may outlast the next command on the UART
@@ -237,15 +249,15 @@ void zbp_board::link_reg(uint32_t off, uint16_t v, uint32_t jobs_before, uint32_
 
 void zbp_board::link_vram(uint32_t off)
 {
-    if (link.is_open())
-        link.write(off & ~1u, core.read16(off & ~1u));
+    if (link.active())
+        link.write(off & ~1u, 0);    // marked as changed; the flush reads the model's value
 }
 
 // ---- the interface
 
 static zbp_board *do_create(const zbp_host *host, void *host_ctx, const char *options)
 {
-    if (!host || host->struct_size < sizeof(zbp_host))
+    if (!host || host->struct_size < HOST_V1)
         return nullptr;
     auto *b = new (std::nothrow) zbp_board{};
     if (!b)
@@ -294,7 +306,7 @@ static void p_destroy(zbp_board *b)
 {
     if (!b)
         return;
-    b->link.close();
+    b->link.flush(true);             // the rest of the stream, before the host closes the channel
     if (b->in_fd >= 0)
         close(b->in_fd);
     if (b->tf)
@@ -315,18 +327,24 @@ static void do_configured(zbp_board *b, uint32_t base, uint64_t now_ns)
         b->in_fd = open(in_src, O_RDONLY | O_NONBLOCK);
         b->log(ZBP_LOG_INFO, "Zorro2RTG: USB input from %s%s", in_src, b->in_fd < 0 ? " failed to open" : "");
     }
-    if (const char *dev = b->get("bridge")) {
-        if (b->link.is_open() || b->link.open(dev, b->get_int("bridge_baud", 3000000), b->link_log())) {
-            // the real board starts from the model's power-on state
-            b->link.write(Z2R_REG_CTRL, 0);
-            b->link.write(Z2R_REG_BANK, 0);
-            b->link.write(Z2R_REG_STATUS, Z2R_STATUS_VBLANK | Z2R_STATUS_BLT_ERR);
-            if (b->in_bridge) {
-                // keyboard and mouse on the real board's USB input (an RP2040 on pin 51) drive the emulated one
-                b->link.enable_input();
-                b->log(ZBP_LOG_INFO, "Zorro2RTG: USB input from the real board over the bridge");
-            }
-        }
+    b->link.stop();
+    b->in_wait.clear();
+    if (b->get("bridge"))
+        b->log(ZBP_LOG_WARN, "Zorro2RTG: the bridge option is gone; the host's daemon channel carries board in the loop");
+    if (b->channel_up()) {
+        // the host opened the channel to the peer: the stream goes to the real board through it
+        zbp_board *self = b;
+        b->link.start([self](const uint8_t *m, uint32_t n) { return self->host->send(self->ctx, m, n) != 0; },
+                      [self](uint32_t off) { return self->core.read16(off); }, b->in_bridge);
+        // the real board starts from the model's power-on state
+        b->link.write(Z2R_REG_CTRL, 0);
+        b->link.write(Z2R_REG_BANK, 0);
+        b->link.write(Z2R_REG_STATUS, Z2R_STATUS_VBLANK | Z2R_STATUS_BLT_ERR);
+        b->link.flush(true);
+        b->log(ZBP_LOG_INFO, "Zorro2RTG: board in the loop through the host's channel%s",
+               b->in_bridge ? ", USB input from the real board" : "");
+    } else if (b->in_bridge) {
+        b->log(ZBP_LOG_WARN, "Zorro2RTG: input=bridge needs the host's channel to the daemon; no input");
     }
 }
 
@@ -367,6 +385,10 @@ static void do_write(zbp_board *b, uint32_t off, uint32_t v, int bytes, uint64_t
         return;
     }
     const uint32_t jobs = b->core.blt_jobs, bbytes = b->core.blt_bytes;
+    // the model's blitter finishes at once and BANK changes what an offset means: the changed VRAM goes
+    // out first, with its values from before the write
+    if ((off & ~1u) == Z2R_REG_BLT_OP || (off & ~1u) == Z2R_REG_BANK)
+        b->link.flush(true);
     if (bytes != 1) {
         b->core.write16(off, static_cast<uint16_t>(v), 3);
         b->link_reg(off, static_cast<uint16_t>(v), jobs, bbytes);
@@ -392,6 +414,19 @@ static uint32_t do_tick(zbp_board *b, uint64_t now_ns)
     if (!b->configured)
         return 0;
     b->advance(now_ns);
+    if (b->link.active()) {
+        if (b->channel_up()) {
+            // messages from the peer: acknowledgements (room for more VRAM) and input events
+            b->rx.resize(ZBP_MSG_MAX);
+            std::array<uint8_t, 7> ev;
+            while (const uint32_t n = b->host->recv(b->ctx, b->rx.data(), ZBP_MSG_MAX))
+                if (b->link.receive(b->rx.data(), n, ev))
+                    b->in_wait.push_back(ev);
+            b->link.flush();
+        } else {
+            b->link.stop();          // the host lost the daemon: retried at the next Autoconfig
+        }
+    }
     if (b->next_poll > now_ns + POLL_NS)    // time went back a little, short of a resync
         b->next_poll = now_ns;
     if (now_ns >= b->next_poll) {
@@ -402,11 +437,12 @@ static uint32_t do_tick(zbp_board *b, uint64_t now_ns)
             for (ssize_t i = 0; i < n; i++)
                 b->core.in_link_byte(buf[i]);
         }
-        // input=bridge: only as many as the emulated queue has room for; the rest wait in the link, so an
+        // input=bridge: only as many as the emulated queue has room for; the rest wait here, so an
         // emulated Amiga that is busy (a long redraw) delays events instead of losing them
-        std::array<uint8_t, 7> ev;
-        while (b->core.in_q.size() < Z2rtgCore::IN_DEPTH && b->link.take_event(ev))
-            b->core.in_event(ev);
+        while (b->core.in_q.size() < Z2rtgCore::IN_DEPTH && !b->in_wait.empty()) {
+            b->core.in_event(b->in_wait.front());
+            b->in_wait.pop_front();
+        }
         if (b->core.blt_jobs != b->last_jobs && !(b->core.blt_jobs % 1000)) {
             b->last_jobs = b->core.blt_jobs;
             b->log(ZBP_LOG_INFO, "Zorro2RTG: %u blitter jobs, %u bytes", b->core.blt_jobs, b->core.blt_bytes);
@@ -476,7 +512,7 @@ static int do_frame(zbp_board *b, zbp_frame *f)
 }
 
 // The C interface lets no exception out (zboard_plugin.h, "Conventions"). The model allocates (a COPY's
-// source, the frame, the input queues, the link's thread), so each call that can catches everything: the
+// source, the frame, the input queues, the link's messages), so each call that can catches everything: the
 // access or frame is lost and logged, the emulator goes on.
 static void caught(zbp_board *b, const char *where)
 {

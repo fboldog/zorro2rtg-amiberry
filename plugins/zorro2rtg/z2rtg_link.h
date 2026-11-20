@@ -1,106 +1,87 @@
-// Board-in-the-loop link: mirrors the emulated board's writes to a real Nano 20K through the UART debug
-// bridge (docs/debug_bridge.md, docs/driver.md in the Zorro2-Tang25k project). The real gateware then shows what the emulated Amiga
-// draws on its own HDMI output. Emulator-independent, POSIX.
-//   - One queue, so the real board sees the writes in the model's order. Consecutive word offsets are
-//     sent as bursts of up to 256 words, with up to four bursts in flight.
-//   - wait_blitter() puts a marker in the queue: the link polls the real STATUS until BLT_BUSY clears
+// Board in the loop, the plugin's half: the emulated board's writes as messages for its peer in the daemon
+// (peer.py next to this file), which sends them to a real Nano 20K over the UART debug bridge
+// (docs/debug_bridge.md, docs/driver.md in the Zorro2-Tang25k project). The real gateware then shows what
+// the emulated Amiga draws on its own HDMI output. The plugin never opens a port: the messages go through
+// the host's channel (zbp_host.send, include/zboard_plugin.h). No thread, no I/O; emulator-independent.
+//   - Register writes (below VRAM) keep their order in a queue; consecutive offsets become one run.
+//   - VRAM writes only mark their word as changed. A flush sends the model's current value of each changed
+//     word, in runs, so a word written many times costs one write, and a CPU loop that rewrites a place
+//     costs nothing extra.
+//   - The peer acknowledges each message once it has passed it to the bridge ('A'). Changed VRAM goes out
+//     only while at most MAX_UNACKED messages are unacknowledged: when the real board falls behind (a
+//     window outline drawn by the CPU, one word per row), the changes merge here, the emulated Amiga never
+//     waits, and the real board skips the intermediate pictures but ends exact.
+//   - Before a blitter start (BLT_OP) or a BANK write reaches the model, flush(true) sends every change
+//     regardless: the model's blitter finishes at once, so the values after it would already hold the
+//     job's result, and BANK changes what an offset means. Registers go before the changed VRAM in a
+//     flush, so a job started earlier runs before the writes that follow it.
+//   - wait_blitter() puts a barrier in the stream: the peer polls the real STATUS until BLT_BUSY clears
 //     before it sends anything after it. The emulated CPU waits on the model's BLT_BUSY, which the real
 //     board never sees, so a long job would otherwise still be running when the next writes arrive.
 //   - Reads are never forwarded: the model answers them.
-//   - enable_input(): the real board's USB input queue (IN_*, docs/usb_input.md) becomes the source of the
-//     model's events. About every 5 ms, also between the bursts of a long redraw, the link reads IN_STATUS and IN_EV0-3 and pops each
-//     event on the real board; take_event() hands them to the emulator. Writes to IN_* are then not
-//     forwarded, so the emulated driver's IN_POP never pops a real event.
-//   - A burst the bridge refuses ('e', for example after a pause on the USB side) is sent again, with
-//     every burst after it, once the bridge has resynchronised. Word writes can be repeated safely; a
-//     repeated BLT_OP would run its job twice, which is logged.
-//   - A port that goes away (the module dropped off USB and came back under another name) is logged once
-//     and the link stops: is_open() turns false and nothing more is sent. The real board then keeps its last
-//     picture. The next Autoconfig (a reset of the emulated Amiga) opens the port again, and the reboot
-//     redraws everything; start.sh names the port by its /dev/serial/by-id link, which follows the module.
-//   - Transport: the serial port itself, or ("unix:PATH" or a socket path) the Unix socket of z2bridged.py,
-//     which carries the same protocol and shares the board with other programs (README.md). A socket the
-//     daemon closes counts as a lost port. Replies through the daemon are waited for up to 10 minutes,
-//     since it holds this link's commands while a host tool holds the board (the emulation stalls then).
-//     A refused command is answered with a lone 'e' there too, also where a read's data should be, so a
-//     read is never waited for past it (reply()).
-//   - The queue is bounded (MAX_QUEUE writes waiting, about 6 MB): once it is full, write() waits for the
-//     worker, so a link that cannot keep up (a host tool holding the board, a slow port) slows the emulated
-//     board down instead of growing the queue without limit.
-//   - close() lets the worker finish what is queued for up to CLOSE_MS, then gives up on replies still
-//     outstanding, so a daemon that never answers cannot hold up the emulator's shutdown.
+//   - With input on, the peer polls the real board's USB input queue (IN_*, docs/usb_input.md) and sends
+//     each event back. Writes to IN_* are then not forwarded, so the emulated driver's IN_POP never pops a
+//     real event.
+//
+// Messages, plugin -> peer: a sequence of records, up to MSG_MAX bytes in all
+//   'Z' e                                           a new stream (epoch e): count acknowledgements from 0
+//   'W' a2 a1 a0 nH nL  then n big-endian words     n consecutive words from board offset a (n <= RUN_MAX)
+//   'B'                                             blitter barrier
+//   'I'                                             poll the real board's input queue from now on
+// peer -> plugin: one record per message
+//   'E' t p0 p1 p2 p3 p4 p5                         an input event (IN_EV0-3: type, then six bytes)
+//   'A' e n3 n2 n1 n0                               n messages of epoch e passed to the bridge so far
 // SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef Z2RTG_LINK_H
 #define Z2RTG_LINK_H
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <cstdint>
-#include <cstdio>
-#include <deque>
-#include <mutex>
 #include <array>
-#include <thread>
-#include <string>
+#include <cstdint>
+#include <functional>
 #include <vector>
 
 class Z2rtgLink {
 public:
-    ~Z2rtgLink();
-    // opens the serial port (raw 8N1), or with "unix:PATH" or a socket path z2bridged's Unix socket, which
-    // carries the same protocol; then pings the bridge. log may be null
-    bool open(const char *device, int baud, FILE *log);
-    bool is_open() const { return fd >= 0 && !lost; }
-    void write(uint32_t offset, uint16_t value);       // a word at a board offset (even)
+    using SendFn = std::function<bool(const uint8_t *msg, uint32_t len)>;
+    using ReadFn = std::function<uint16_t(uint32_t offset)>;   // the model's VRAM word at a board offset
+
+    // the channel is up: from now on the stream goes to send; read gives the changed words' values;
+    // input: poll the real board's input queue
+    void start(SendFn send, ReadFn read, bool input);
+    void stop();                                       // the channel is gone: queued writes are dropped
+    bool active() const { return static_cast<bool>(out); }
+    void write(uint32_t offset, uint16_t value);       // a word at a board offset (even); VRAM: value unused
     void wait_blitter();                               // the real BLT_BUSY must clear before what follows
-    void enable_input() { input = true; }              // poll the real board's USB input queue
-    bool take_event(std::array<uint8_t, 7> &ev);       // the next event read from it, if any
-    void close();
+    // queued registers into messages, and the changed VRAM when force or the peer has room
+    void flush(bool force = false);
+    // a message from the peer: an acknowledgement is taken here; true and ev filled for an input event
+    bool receive(const uint8_t *msg, uint32_t len, std::array<uint8_t, 7> &ev);
+    bool room() const { return sent - acked <= MAX_UNACKED; }
 
-    static constexpr size_t MAX_QUEUE = size_t(1) << 19;   // writes waiting for the worker
-    static constexpr int CLOSE_MS = 2000;                  // close(): time left for the queue and its replies
+    static constexpr uint32_t MSG_MAX = 32768;         // bytes per message (ZBP_MSG_MAX is the limit)
+    static constexpr uint32_t RUN_MAX = 4096;          // words per 'W' record
+    static constexpr size_t FLUSH_AT = 65536;          // queued register writes that flush without waiting
+    static constexpr uint32_t MAX_UNACKED = 2;         // messages the peer may hold before VRAM waits
 
-    // statistics (read without the lock: approximate)
-    uint64_t words = 0, bursts = 0, polls = 0, errors = 0, resent = 0, events = 0, in_overflows = 0, in_frame_errs = 0;
-    uint64_t full_waits = 0;                               // write() calls that waited for room in the queue
-    size_t queue_max = 0;
+    uint64_t words = 0, messages = 0, barriers = 0, held = 0;   // statistics; held: flushes VRAM waited
 
 private:
     struct Item { uint32_t off; uint16_t v; bool wait; };
-    int fd = -1;
-    bool sock = false;                           // fd is a Unix socket to z2bridged, not the serial port
-    std::atomic<bool> lost {false};              // the port failed: stop sending
-    std::string dev;
-    FILE *log = nullptr;
-    std::thread th;
-    std::mutex mx;
-    std::condition_variable cv;
-    std::condition_variable room;                // the worker took the queue (write() waits on a full one)
-    std::deque<Item> q;
-    bool stop = false;
-    std::atomic<bool> input {false};
-    std::deque<std::array<uint8_t, 7>> evq;      // events from the real board, under mx
-    std::deque<std::vector<uint8_t>> inflight;   // bursts sent and not yet acknowledged, oldest first
-    // close(): from this steady_clock time on, no reply is waited for (0: not closing)
-    std::atomic<int64_t> quit_at {0};
-    bool quitting() const;
+    SendFn out;
+    ReadFn rd;
+    bool input = false;
+    uint8_t epoch = 0;
+    uint32_t sent = 0, acked = 0;                      // messages of this epoch
+    std::vector<Item> q;                               // registers and barriers, in order
+    std::vector<uint64_t> dirty;                       // one bit per VRAM word
+    std::vector<uint32_t> groups;                      // indices into dirty that have a bit set
+    std::vector<uint8_t> msg;
+    std::vector<uint16_t> run;
 
-    void run();
-    void port_lost(const char *what);
-    void flush_input();
-    bool send(const uint8_t *p, size_t n);
-    int recv(uint8_t *p, size_t n, int timeout_ms);
-    int recv_raw(uint8_t *p, size_t n, int timeout_ms);
-    int reply(uint8_t *p, size_t n, int timeout_ms);   // a command's reply: n bytes, or 1 ('e') if refused
-    bool ack();
-    bool drain();
-    bool recover();
-    bool burst(uint32_t off, const uint16_t *w, unsigned n);
-    bool blitter_idle();
-    void poll_input();
-    void maybe_poll_input();                     // poll_input() if 5 ms have passed since the last
-    std::chrono::steady_clock::time_point next_input {};
+    void put_run(uint32_t off, const uint16_t *w, uint32_t n);
+    void put(uint8_t rec);
+    void send_msg();
+    void put_vram();
 };
 
 #endif

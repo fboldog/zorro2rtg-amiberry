@@ -48,10 +48,11 @@ def main():
     if old.exists():
         old.unlink()
     shutil.copy(HERE / "zboard_amiberry.cpp", src / "src" / "zboard_amiberry.cpp")
+    shutil.copy(REPO / "hosts" / "common" / "zboard_channel.cpp", src / "src" / "zboard_channel.cpp")
     for f in ("z2rtg_plugin.cpp", "z2rtg_core.cpp", "z2rtg_link.cpp"):
         shutil.copy(PLUGIN / f, src / "src" / f)
     for f in (PLUGIN / "z2rtg_core.h", PLUGIN / "z2rtg_link.h", PLUGIN / "zorro2rtg_regs.h",
-              REPO / "include" / "zboard_plugin.h"):
+              REPO / "include" / "zboard_plugin.h", REPO / "hosts" / "common" / "zboard_channel.h"):
         shutil.copy(f, src / "src" / "include" / f.name)
     h = src / "src/include/gfxboard.h"
     g = src / "src/gfxboard.cpp"
@@ -81,6 +82,7 @@ def main():
     edit(c, "        src/zz9000.cpp\n", "        src/zboard_amiberry.cpp\n        src/z2rtg_core.cpp\n")
     edit(c, "        src/z2rtg_core.cpp\n", "        src/z2rtg_link.cpp\n")
     edit(c, "        src/z2rtg_link.cpp\n", "        src/z2rtg_plugin.cpp\n")
+    edit(c, "        src/z2rtg_plugin.cpp\n", "        src/zboard_channel.cpp\n")
 
 
 if __name__ == "__main__":

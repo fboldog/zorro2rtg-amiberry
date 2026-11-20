@@ -1,588 +1,181 @@
-// Board-in-the-loop link to a real Nano 20K (z2rtg_link.h).
+// Board in the loop, the plugin's half (z2rtg_link.h).
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "z2rtg_link.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <chrono>
-#include <cstring>
-#include <fcntl.h>
-#include <map>
-#include <poll.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <termios.h>
-#include <unistd.h>
-#include <vector>
 
 #include "zorro2rtg_regs.h"
 
-static constexpr unsigned BURST = 256;       // words per bridge burst
-static constexpr int WINDOW = 4;             // bursts in flight (docs/debug_bridge.md)
-static constexpr uint32_t VRAM_START = 0x010000;   // below: registers, palette, cursor image (kept in order)
+static constexpr uint32_t VRAM_START = Z2R_VRAM_START;   // below: registers, palette, cursor image (in order)
+static constexpr uint32_t WINDOW = 0x400000u;             // the 4 MB board window
+static constexpr uint32_t VRAM_WORDS = (WINDOW - VRAM_START) / 2;
 
-Z2rtgLink::~Z2rtgLink() { close(); }
-
-static int64_t steady_ms()
+void Z2rtgLink::start(SendFn send, ReadFn read, bool in)
 {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch()).count();
+    q.clear();
+    msg.clear();
+    dirty.assign((VRAM_WORDS + 63) / 64, 0);
+    groups.clear();
+    out = std::move(send);
+    rd = std::move(read);
+    input = in;
+    epoch++;
+    sent = acked = 0;
+    put('Z');
+    msg.push_back(epoch);
+    if (input)
+        put('I');
+    send_msg();
 }
 
-bool Z2rtgLink::quitting() const
+void Z2rtgLink::stop()
 {
-    const int64_t q = quit_at.load();
-    return q && steady_ms() >= q;
-}
-
-// "unix:PATH", or a path that is a socket: the debug-bridge protocol through z2bridged (README.md)
-static bool socket_path(const char *device, std::string &path)
-{
-    if (!strncmp(device, "unix:", 5)) {
-        path = device + 5;
-        return true;
-    }
-    struct stat st {};
-    if (stat(device, &st) == 0 && S_ISSOCK(st.st_mode)) {
-        path = device;
-        return true;
-    }
-    return false;
-}
-
-// sun_path holds 107 characters: a longer path is reached through its directory's /proc/self/fd entry
-// (no chdir, which would race with the emulator's other threads)
-static int connect_unix(const std::string &path)
-{
-    const int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (s < 0)
-        return -1;
-    sockaddr_un a {};
-    a.sun_family = AF_UNIX;
-    int dfd = -1;
-    std::string target = path;
-    if (target.size() >= sizeof a.sun_path) {
-        const size_t slash = path.rfind('/');
-        const std::string dir = slash == 0 ? "/" : path.substr(0, slash);
-        dfd = ::open(dir.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
-        target = "/proc/self/fd/" + std::to_string(dfd) + "/" + path.substr(slash + 1);
-    }
-    int r = -1;
-    if (target.size() < sizeof a.sun_path) {
-        memcpy(a.sun_path, target.c_str(), target.size() + 1);
-        r = connect(s, reinterpret_cast<sockaddr *>(&a), sizeof a);
-    } else {
-        errno = ENAMETOOLONG;
-    }
-    const int e = errno;
-    if (dfd >= 0)
-        ::close(dfd);
-    if (r < 0) {
-        ::close(s);
-        errno = e;
-        return -1;
-    }
-    return s;
-}
-
-// input still waiting after an error: tcflush on the serial port, read and dropped on a socket
-void Z2rtgLink::flush_input()
-{
-    if (!sock) {
-        tcflush(fd, TCIFLUSH);
-        return;
-    }
-    uint8_t buf[512];
-    while (::recv(fd, buf, sizeof buf, MSG_DONTWAIT) > 0) {
-    }
-}
-
-static speed_t baud_const(int baud)
-{
-    switch (baud) {
-    case 115200: return B115200;
-    case 1000000: return B1000000;
-    case 2000000: return B2000000;
-    default: return B3000000;
-    }
-}
-
-bool Z2rtgLink::open(const char *device, int baud, FILE *lg)
-{
-    close();                                     // a port lost earlier: its thread and descriptor
-    log = lg;
-    dev = device;
-    lost = false;
-    quit_at = 0;
-    std::string spath;
-    sock = socket_path(device, spath);
-    if (sock) {
-        fd = connect_unix(spath);
-        if (fd < 0) {
-            if (log) fprintf(log, "z2rtg link: %s: %s (is z2bridged running?)\n", spath.c_str(), strerror(errno));
-            return false;
-        }
-    } else {
-        fd = ::open(device, O_RDWR | O_NOCTTY);
-        if (fd < 0) {
-            if (log) fprintf(log, "z2rtg link: %s: %s\n", device, strerror(errno));
-            return false;
-        }
-        termios t {};
-        tcgetattr(fd, &t);
-        cfmakeraw(&t);
-        t.c_cflag |= CLOCAL | CREAD;
-        cfsetispeed(&t, baud_const(baud));
-        cfsetospeed(&t, baud_const(baud));
-        tcsetattr(fd, TCSANOW, &t);
-        tcflush(fd, TCIOFLUSH);
-    }
-    uint8_t c = '?', r = 0;
-    if (!send(&c, 1) || recv(&r, 1, sock ? 3000 : 500) != 1 || r != 'Z') {
-        if (sock) {
-            if (log) fprintf(log, "z2rtg link: no bridge ping through %s\n", spath.c_str());
-        } else if (log) {
-            fprintf(log, "z2rtg link: no bridge ping on %s at %d baud\n", device, baud);
-        }
-        ::close(fd);
-        fd = -1;
-        return false;
-    }
-    if (sock) {
-        if (log) fprintf(log, "z2rtg link: bridge through z2bridged at %s\n", spath.c_str());
-    } else if (log) {
-        fprintf(log, "z2rtg link: bridge on %s at %d baud\n", device, baud);
-    }
-    stop = false;
-    th = std::thread(&Z2rtgLink::run, this);
-    return true;
-}
-
-void Z2rtgLink::close()
-{
-    const bool was_open = th.joinable() || fd >= 0;
-    if (th.joinable()) {
-        {
-            std::lock_guard<std::mutex> g(mx);
-            stop = true;
-        }
-        // the worker finishes the queue, but waits for no reply after CLOSE_MS: a daemon that holds this
-        // client's commands (or never answers) must not hold up the emulator's exit
-        quit_at = steady_ms() + CLOSE_MS;
-        cv.notify_all();
-        room.notify_all();
-        th.join();
-    }
-    if (fd >= 0) {
-        ::close(fd);
-        fd = -1;
-    }
-    if (log && was_open)
-        fprintf(log, "z2rtg link: %llu words in %llu bursts, %llu blitter polls, %llu errors, %llu bursts resent, "
-                "queue up to %zu (%llu waits for room), %llu input events, %llu input overflows\n",
-                (unsigned long long)words, (unsigned long long)bursts, (unsigned long long)polls,
-                (unsigned long long)errors, (unsigned long long)resent, queue_max, (unsigned long long)full_waits,
-                (unsigned long long)events, (unsigned long long)in_overflows);
-}
-
-void Z2rtgLink::port_lost(const char *what)
-{
-    if (lost.exchange(true))
-        return;
-    if (log) {
-        fprintf(log, "z2rtg link: lost %s (%s): no more writes reach the real board, which keeps its last "
-                "picture. A reset of the emulated Amiga opens the port again\n", dev.c_str(), what);
-        fflush(log);
-    }
+    out = nullptr;
+    rd = nullptr;
+    input = false;
+    q.clear();
+    msg.clear();
+    groups.clear();
+    std::fill(dirty.begin(), dirty.end(), 0);
 }
 
 void Z2rtgLink::write(uint32_t offset, uint16_t value)
 {
-    if (!is_open())
+    if (!out)
         return;
     offset &= 0x3FFFFEu;
-    if (input && offset >= Z2R_REG_IN_STATUS && offset <= Z2R_REG_IN_POP)
-        return;                                  // the real queue belongs to the link (enable_input)
-    {
-        std::unique_lock<std::mutex> g(mx);
-        // the same VRAM word again (a CPU loop rewriting one place): only its last value matters
-        if (offset >= VRAM_START && !q.empty() && !q.back().wait && q.back().off == offset) {
-            q.back().v = value;
-            return;
-        }
-        if (q.size() >= MAX_QUEUE) {
-            // the real board is far behind: wait for the worker instead of queueing without limit
-            full_waits++;
-            cv.notify_one();
-            room.wait(g, [this] { return q.size() < MAX_QUEUE || stop || lost; });
-            if (stop || lost)
-                return;
-        }
-        q.push_back({offset, value, false});
-        if (q.size() > queue_max) queue_max = q.size();
+    if (offset >= VRAM_START) {
+        const uint32_t i = (offset - VRAM_START) / 2;
+        uint64_t &g = dirty[i / 64];
+        if (!g)
+            groups.push_back(i / 64);
+        g |= 1ull << (i % 64);
+        return;
     }
-    cv.notify_one();
+    if (input && offset >= Z2R_REG_IN_STATUS && offset <= Z2R_REG_IN_POP)
+        return;                                  // the real queue belongs to the peer (input on)
+    q.push_back({offset, value, false});
+    if (q.size() >= FLUSH_AT)
+        flush();
 }
 
 void Z2rtgLink::wait_blitter()
 {
-    if (!is_open())
+    if (!out)
         return;
-    {
-        std::unique_lock<std::mutex> g(mx);
-        if (q.size() >= MAX_QUEUE) {
-            full_waits++;
-            cv.notify_one();
-            room.wait(g, [this] { return q.size() < MAX_QUEUE || stop || lost; });
-            if (stop || lost)
-                return;
+    q.push_back({0, 0, true});
+}
+
+void Z2rtgLink::send_msg()
+{
+    if (msg.empty())
+        return;
+    if (out && !out(msg.data(), static_cast<uint32_t>(msg.size())))
+        stop();                                  // the channel went away under us
+    messages++;
+    sent++;
+    msg.clear();
+}
+
+void Z2rtgLink::put(uint8_t rec)
+{
+    if (msg.size() + 2 > MSG_MAX)
+        send_msg();
+    msg.push_back(rec);
+}
+
+void Z2rtgLink::put_run(uint32_t off, const uint16_t *w, uint32_t n)
+{
+    while (n && out) {
+        // as many words as fit in this message, at least one; else a new message
+        uint32_t room = msg.size() + 6 + 2 < MSG_MAX ? static_cast<uint32_t>((MSG_MAX - msg.size() - 6) / 2) : 0;
+        if (!room) {
+            send_msg();
+            continue;
         }
-        q.push_back({0, 0, true});
+        const uint32_t k = std::min({n, room, RUN_MAX});
+        msg.push_back('W');
+        msg.push_back(static_cast<uint8_t>(off >> 16));
+        msg.push_back(static_cast<uint8_t>(off >> 8));
+        msg.push_back(static_cast<uint8_t>(off));
+        msg.push_back(static_cast<uint8_t>(k >> 8));
+        msg.push_back(static_cast<uint8_t>(k));
+        for (uint32_t i = 0; i < k; i++) {
+            msg.push_back(static_cast<uint8_t>(w[i] >> 8));
+            msg.push_back(static_cast<uint8_t>(w[i]));
+        }
+        words += k;
+        off += 2 * k;
+        w += k;
+        n -= k;
     }
-    cv.notify_one();
 }
 
-bool Z2rtgLink::send(const uint8_t *p, size_t n)
+void Z2rtgLink::put_vram()
 {
-    while (n) {
-        if (lost)
-            return false;
-        // a socket whose daemon went away must not raise SIGPIPE in the emulator
-        ssize_t k = sock ? ::send(fd, p, n, MSG_NOSIGNAL) : ::write(fd, p, n);
-        if (k < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            port_lost(strerror(errno));
-            return false;
-        }
-        p += k;
-        n -= static_cast<size_t>(k);
-    }
-    return true;
-}
-
-// Through z2bridged the daemon answers every command itself ('e' when the board does not), and holds this
-// client's commands while another client holds the board, so the wait there is long: the emulation stalls
-// meanwhile. A daemon that goes away closes the socket.
-static constexpr int SOCK_WAIT_MS = 600000;
-
-int Z2rtgLink::recv(uint8_t *p, size_t n, int timeout_ms)
-{
-    if (sock && timeout_ms < SOCK_WAIT_MS)
-        timeout_ms = SOCK_WAIT_MS;
-    return recv_raw(p, n, timeout_ms);
-}
-
-// up to n bytes within timeout_ms; less once close() has given up waiting (quit_at)
-int Z2rtgLink::recv_raw(uint8_t *p, size_t n, int timeout_ms)
-{
-    size_t got = 0;
-    int64_t end = steady_ms() + timeout_ms;
-    while (got < n) {
-        const int64_t q = quit_at.load();
-        const int64_t now = steady_ms();
-        const int64_t until = q && q < end ? q : end;
-        if (now >= until) break;
-        if (lost) break;
-        // in slices, so that close() setting quit_at is seen during a long wait through the daemon
-        const int left = static_cast<int>(std::min<int64_t>(until - now, 100));
-        pollfd pf {fd, POLLIN, 0};
-        if (poll(&pf, 1, left) <= 0) continue;
-        if (pf.revents & (POLLHUP | POLLERR | POLLNVAL)) {
-            port_lost("hang-up");
-            break;
-        }
-        ssize_t k = ::read(fd, p + got, n - got);
-        if (k > 0) got += static_cast<size_t>(k);
-        else if (k == 0 || (errno != EINTR && errno != EAGAIN)) {
-            port_lost(k == 0 ? "end of file" : strerror(errno));
-            break;
+    // every changed word, in address order, as runs of consecutive words with the model's values now
+    std::sort(groups.begin(), groups.end());
+    uint32_t start = 0;
+    run.clear();
+    for (const uint32_t gi : groups) {
+        uint64_t bits = dirty[gi];
+        dirty[gi] = 0;
+        while (bits && out) {
+            const uint32_t b = static_cast<uint32_t>(__builtin_ctzll(bits));
+            bits &= bits - 1;
+            const uint32_t off = VRAM_START + 2 * (gi * 64 + b);
+            if (!run.empty() && (off != start + 2 * run.size() || run.size() >= RUN_MAX)) {
+                put_run(start, run.data(), static_cast<uint32_t>(run.size()));
+                run.clear();
+            }
+            if (run.empty())
+                start = off;
+            run.push_back(rd(off));
         }
     }
-    return static_cast<int>(got);
+    if (!run.empty() && out)
+        put_run(start, run.data(), static_cast<uint32_t>(run.size()));
+    groups.clear();
 }
 
-// The reply to one command, n bytes. The bridge refuses a command with a lone 'e', and z2bridged does the
-// same for each command the bridge dropped, also where a read's data should be (z2bridged.py, "Errors").
-// A real reply of more than one byte comes in one piece, from the daemon's single send or at full baud
-// rate from the bridge, so a first byte 'e' with nothing after it within REFUSED_MS is a refusal: then 1
-// is returned, never a wait for data that will not come.
-static constexpr int REFUSED_MS = 100;
-
-int Z2rtgLink::reply(uint8_t *p, size_t n, int timeout_ms)
+void Z2rtgLink::flush(bool force)
 {
-    if (recv(p, 1, timeout_ms) != 1)
-        return 0;
-    if (n == 1)
-        return 1;
-    if (p[0] == 'e')
-        return 1 + recv_raw(p + 1, n - 1, REFUSED_MS);
-    return 1 + recv(p + 1, n - 1, timeout_ms);
+    if (!out)
+        return;
+    std::vector<uint16_t> regs;
+    for (size_t i = 0; i < q.size() && out;) {
+        if (q[i].wait) {
+            put('B');
+            barriers++;
+            i++;
+            continue;
+        }
+        // registers in order; consecutive offsets become one run
+        const uint32_t start = q[i].off;
+        regs.clear();
+        while (i < q.size() && !q[i].wait && regs.size() < RUN_MAX && q[i].off == start + 2 * regs.size())
+            regs.push_back(q[i++].v);
+        put_run(start, regs.data(), static_cast<uint32_t>(regs.size()));
+    }
+    q.clear();
+    if (!groups.empty()) {
+        if (force || room())
+            put_vram();
+        else
+            held++;
+    }
+    send_msg();
 }
 
-bool Z2rtgLink::ack()
+bool Z2rtgLink::receive(const uint8_t *m, uint32_t len, std::array<uint8_t, 7> &ev)
 {
-    uint8_t r = 0;
-    if (recv(&r, 1, 2000) == 1 && r == 'k') {
-        inflight.pop_front();
+    if (len == 8 && m[0] == 'E') {
+        std::copy(m + 1, m + 8, ev.begin());
         return true;
     }
-    if (lost) {
-        inflight.clear();
-        return false;
+    if (len == 6 && m[0] == 'A' && m[1] == epoch) {
+        const uint32_t n = (static_cast<uint32_t>(m[2]) << 24) | (m[3] << 16) | (m[4] << 8) | m[5];
+        acked = std::min(n, sent);
     }
-    errors++;
-    if (log)
-        fprintf(log, "z2rtg link: expected 'k' for the burst at %02x%02x%02x of %u words, got %s; %zu in flight\n",
-                inflight.front()[1], inflight.front()[2], inflight.front()[3], inflight.front()[4] + 1u,
-                r == 'e' ? "'e'" : r ? "another byte" : "nothing", inflight.size());
-    return recover();
-}
-
-bool Z2rtgLink::drain()
-{
-    while (!inflight.empty())
-        if (!ack())
-            return false;
-    return true;
-}
-
-// The bridge ignores input after an error until it has seen a gap of 20 ms (UART_GAP), then answers 'e'.
-// Wait that out, then send the refused burst and every one after it again, one at a time.
-bool Z2rtgLink::recover()
-{
-    for (int attempt = 0; attempt < 3 && !lost && !quitting(); attempt++) {
-        usleep(30000);
-        flush_input();
-        bool ok = true;
-        while (ok && !inflight.empty()) {
-            const std::vector<uint8_t> &p = inflight.front();
-            uint32_t off = (p[1] << 16) | (p[2] << 8) | p[3];
-            if (log && off <= Z2R_REG_BLT_OP && off + 2u * (p[4] + 1u) > Z2R_REG_BLT_OP)
-                fprintf(log, "z2rtg link: resending a burst with BLT_OP: the job may run twice\n");
-            uint8_t r = 0;
-            ok = send(p.data(), p.size()) && recv(&r, 1, 2000) == 1 && r == 'k';
-            if (ok) {
-                inflight.pop_front();
-                resent++;
-            }
-        }
-        if (ok)
-            return true;
-        errors++;
-    }
-    if (lost) {
-        inflight.clear();
-        return false;
-    }
-    if (log)
-        fprintf(log, "z2rtg link: %zu bursts dropped after three attempts; the real board is out of step\n",
-                inflight.size());
-    inflight.clear();
     return false;
-}
-
-bool Z2rtgLink::burst(uint32_t off, const uint16_t *w, unsigned n)
-{
-    std::vector<uint8_t> b;
-    b.reserve(5 + 2 * n);
-    b.push_back('B');
-    b.push_back(static_cast<uint8_t>(off >> 16));
-    b.push_back(static_cast<uint8_t>(off >> 8));
-    b.push_back(static_cast<uint8_t>(off));
-    b.push_back(static_cast<uint8_t>(n - 1));
-    for (unsigned i = 0; i < n; i++) {
-        b.push_back(static_cast<uint8_t>(w[i] >> 8));
-        b.push_back(static_cast<uint8_t>(w[i]));
-    }
-    if (!send(b.data(), b.size()))
-        return false;
-    inflight.push_back(std::move(b));
-    words += n;
-    bursts++;
-    return static_cast<int>(inflight.size()) < WINDOW || ack();
-}
-
-bool Z2rtgLink::blitter_idle()
-{
-    if (!drain())
-        return false;
-    polls++;
-    const uint8_t cmd[4] = {'R', 0, 0, static_cast<uint8_t>(Z2R_REG_STATUS)};
-    for (int n = 0; n < 2000; n++) {             // a 1280x720 copy takes about 13 ms
-        uint8_t r[2];
-        if (!send(cmd, 4) || reply(r, 2, 500) != 2) {
-            if (lost || quitting())
-                return false;
-            errors++;
-            if (log) fprintf(log, "z2rtg link: no answer to a STATUS read, retrying\n");
-            usleep(30000);                       // a refused read: resynchronise and ask again
-            flush_input();
-            continue;
-        }
-        if (!((r[0] << 8 | r[1]) & Z2R_STATUS_BLT_BUSY))
-            return true;
-    }
-    if (log) fprintf(log, "z2rtg link: the real BLT_BUSY did not clear\n");
-    return false;
-}
-
-bool Z2rtgLink::take_event(std::array<uint8_t, 7> &ev)
-{
-    std::lock_guard<std::mutex> g(mx);
-    if (evq.empty())
-        return false;
-    ev = evq.front();
-    evq.pop_front();
-    return true;
-}
-
-// IN_STATUS .. IN_EV3 in one burst read. An event found is popped on the real board (IN_POP) in the same
-// send as the next read, so each event costs one USB round trip. The pop is only ever sent for an event
-// already read: a pop sent ahead of its read could drop an event that arrived in between.
-void Z2rtgLink::poll_input()
-{
-    if (!drain())
-        return;
-    static const uint8_t rd[5] = {'S', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_STATUS), 5};
-    static const uint8_t pop_rd[11] = {'W', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_POP), 0, Z2R_IN_POP_POP,
-                                       'S', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_STATUS), 5};
-    uint8_t r[13];
-    bool popped = false;                         // the last send was pop + read: 'k' comes first
-    if (!send(rd, sizeof rd))
-        return;
-    for (int n = 0; n < 32 && !lost; n++) {
-        // after a pop + read, the pop's 'k' and then the read's 12 bytes (either may be a lone 'e')
-        const bool ok = popped ? reply(r, 1, 500) == 1 && r[0] == 'k' && reply(r + 1, 12, 500) == 12
-                               : reply(r, 12, 500) == 12;
-        if (!ok) {
-            if (!lost) {
-                errors++;
-                if (log) fprintf(log, "z2rtg link: no answer to an IN_STATUS read\n");
-                usleep(30000);
-                flush_input();
-            }
-            return;
-        }
-        const uint8_t *v = popped ? r + 1 : r;
-        const uint16_t st = static_cast<uint16_t>(v[0] << 8 | v[1]);
-        if (const uint16_t w1c = st & (Z2R_IN_STATUS_OVERFLOW | Z2R_IN_STATUS_FRAME_ERR)) {
-            if (st & Z2R_IN_STATUS_OVERFLOW) in_overflows++;
-            if (st & Z2R_IN_STATUS_FRAME_ERR) in_frame_errs++;
-            if (log && in_overflows + in_frame_errs == 1)
-                fprintf(log, "z2rtg link: real board input %s (counted in the progress line from now on)\n",
-                        st & Z2R_IN_STATUS_OVERFLOW ? "overflow: events were lost" : "frame error");
-            const uint8_t clr[6] = {'W', 0, 0, static_cast<uint8_t>(Z2R_REG_IN_STATUS),
-                                    static_cast<uint8_t>(w1c >> 8), static_cast<uint8_t>(w1c)};
-            uint8_t k = 0;
-            if (!send(clr, 6) || reply(&k, 1, 500) != 1 || k != 'k')
-                return;
-        }
-        if (!(st & Z2R_IN_STATUS_AVAIL))
-            return;
-        // EV0 = type:p0, EV1 = p1:p2, EV2 = p3:p4, EV3 = p5:-
-        std::array<uint8_t, 7> ev {v[4], v[5], v[6], v[7], v[8], v[9], v[10]};
-        {
-            std::lock_guard<std::mutex> g(mx);
-            evq.push_back(ev);
-        }
-        events++;
-        if (!send(pop_rd, sizeof pop_rd))
-            return;
-        popped = true;
-    }
-    // the loop limit was reached right after a pop + read: take its answer, the next poll reads again
-    if (popped && !lost && reply(r, 1, 500) == 1 && r[0] == 'k')
-        reply(r + 1, 12, 500);
-}
-
-void Z2rtgLink::maybe_poll_input()
-{
-    if (!input || lost || std::chrono::steady_clock::now() < next_input)
-        return;
-    poll_input();
-    next_input = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
-}
-
-void Z2rtgLink::run()
-{
-    std::vector<Item> work;
-    std::vector<uint16_t> run_w;
-    auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    next_input = std::chrono::steady_clock::now();
-    for (;;) {
-        maybe_poll_input();
-        {
-            std::unique_lock<std::mutex> g(mx);
-            cv.wait_for(g, std::chrono::milliseconds(input ? 5 : 20), [this] { return stop || !q.empty(); });
-            if (stop && q.empty())
-                break;
-            work.assign(q.begin(), q.end());
-            q.clear();
-        }
-        room.notify_all();
-        if (quitting()) {                        // close() gave up: drop what is left
-            work.clear();
-            inflight.clear();
-            if (stop)
-                break;
-            continue;
-        }
-        if (lost) {
-            work.clear();
-            inflight.clear();
-            continue;
-        }
-        std::map<uint32_t, uint16_t> seg;
-        for (size_t i = 0; i < work.size() && !lost && !quitting();) {
-            // progress every 10 s: a link far behind the emulated board shows as a growing backlog
-            if (log && std::chrono::steady_clock::now() >= next_report) {
-                next_report += std::chrono::seconds(10);
-                fprintf(log, "z2rtg link: %llu words in %llu bursts, %llu polls, %llu errors, %zu writes waiting",
-                        (unsigned long long)words, (unsigned long long)bursts, (unsigned long long)polls,
-                        (unsigned long long)errors, work.size() - i);
-                if (input)
-                    fprintf(log, "; input %llu events, %llu overflows, %llu frame errors",
-                            (unsigned long long)events, (unsigned long long)in_overflows,
-                            (unsigned long long)in_frame_errs);
-                fputc('\n', log);
-                fflush(log);
-            }
-            if (work[i].wait) {
-                maybe_poll_input();
-                blitter_idle();
-                i++;
-                continue;
-            }
-            if (work[i].off < VRAM_START) {
-                // registers in order; consecutive offsets become one burst
-                uint32_t start = work[i].off;
-                run_w.clear();
-                while (i < work.size() && !work[i].wait && work[i].off < VRAM_START && run_w.size() < BURST &&
-                       work[i].off == start + 2 * run_w.size())
-                    run_w.push_back(work[i++].v);
-                burst(start, run_w.data(), static_cast<unsigned>(run_w.size()));
-                maybe_poll_input();
-                continue;
-            }
-            // VRAM up to the next register write or blitter wait: the order inside does not matter, only
-            // each word's last value, so the words go sorted, as long bursts (a CPU clearing memory
-            // backwards would otherwise give one burst per longword)
-            seg.clear();
-            while (i < work.size() && !work[i].wait && work[i].off >= VRAM_START) {
-                seg[work[i].off] = work[i].v;
-                i++;
-            }
-            for (auto it = seg.begin(); it != seg.end() && !lost && !quitting();) {
-                uint32_t start = it->first;
-                run_w.clear();
-                while (it != seg.end() && run_w.size() < BURST && it->first == start + 2 * run_w.size())
-                    run_w.push_back((it++)->second);
-                burst(start, run_w.data(), static_cast<unsigned>(run_w.size()));
-                maybe_poll_input();              // between bursts, so a long redraw does not starve the input
-            }
-        }
-        drain();
-    }
-    drain();
 }

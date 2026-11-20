@@ -18,6 +18,10 @@
  *   them, since /INT2 is level-triggered.
  * - The Autoconfig data is the board's row in gfxboard.cpp, added by integrate.py; it must match the
  *   plugin's zbp_desc. A loader that reads the description instead is for a later Amiberry change.
+ * - The daemon: with ZBOARD_DAEMON set (unix:PATH, a path, or "default" for z2bridged's default socket;
+ *   unset or "none": no daemon), the adapter opens the plugin's channel to its peer (zbp_desc.peer) at each
+ *   Autoconfig, before configured(), through hosts/common/zboard_channel. The plugin itself never opens a
+ *   port. Channel messages go to Amiberry's log and to stderr.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -34,9 +38,15 @@
 #include "newcpu.h"
 #include "devices.h"
 
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <new>
+#include <string>
 
 #include "zboard_plugin.h"
+#include "zboard_channel.h"
 
 struct zb_state {
     const zbp_api *api = nullptr;
@@ -50,6 +60,7 @@ struct zb_state {
     bool rtg_on = false;         // what the board last asked for (host.display)
     bool mode_changed = true;
     int shown_w = 0, shown_h = 0;
+    ZbChannel ch;                // to the board's peer in the daemon (ZBOARD_DAEMON)
 };
 
 static zb_state *zb_boards[MAX_RTG_BOARDS];
@@ -90,6 +101,38 @@ static void zb_display(void *ctx, int on)
 static void zb_log(void *, int, const char *msg)
 {
     write_log(_T("%s\n"), msg);
+}
+
+static int zb_channel_up(void *ctx)
+{
+    return static_cast<zb_state *>(ctx)->ch.up();
+}
+
+static int zb_send(void *ctx, const void *msg, uint32_t len)
+{
+    return static_cast<zb_state *>(ctx)->ch.send(msg, len);
+}
+
+static uint32_t zb_recv(void *ctx, void *buf, uint32_t cap)
+{
+    return static_cast<zb_state *>(ctx)->ch.recv(buf, cap);
+}
+
+// the plugin's peer, when its description names one and the user asked for the daemon
+static void zb_open_channel(zb_state *d)
+{
+    const zbp_desc *desc = d->api->desc;
+    const char *spec = getenv("ZBOARD_DAEMON");
+    if (!spec || !*spec || !strcmp(spec, "none") || d->ch.up())
+        return;
+    if (desc->struct_size < offsetof(zbp_desc, peer) + sizeof desc->peer || !desc->peer) {
+        write_log(_T("zboard: %s has no peer for the daemon\n"), desc->name);
+        return;
+    }
+    d->ch.open(spec, desc->peer, [](int, const std::string &m) {
+        write_log(_T("%s\n"), m.c_str());
+        fprintf(stderr, "%s\n", m.c_str());
+    });
 }
 
 static zb_state *zb_find(uaecptr addr)
@@ -235,6 +278,7 @@ static void zb_configured(void *userdata, uae_u32 address)
 {
     auto *d = static_cast<zb_state *>(userdata);
     d->base = address;
+    zb_open_channel(d);         // the plugin sees the channel from configured() on
     const zbp_desc *desc = d->api->desc;
     for (uint32_t i = 0; i < desc->n_regions; i++) {
         const zbp_region &r = desc->regions[i];
@@ -263,7 +307,8 @@ static void zb_free(void *userdata)
     if (d->devnum >= 0 && d->devnum < MAX_RTG_BOARDS)
         zb_boards[d->devnum] = nullptr;
     if (d->b)
-        d->api->destroy(d->b);
+        d->api->destroy(d->b);  // the plugin flushes what it has into the channel
+    d->ch.close();
     delete d;
 }
 
@@ -290,6 +335,9 @@ static bool zb_init(autoconfig_info *aci)
     d->host.charge_ns = zb_charge;
     d->host.display = zb_display;
     d->host.log = zb_log;
+    d->host.channel_up = zb_channel_up;
+    d->host.send = zb_send;
+    d->host.recv = zb_recv;
     d->b = api->create(&d->host, d, "");   // options: the plugin's environment variables for now
     if (!d->b) {
         delete d;

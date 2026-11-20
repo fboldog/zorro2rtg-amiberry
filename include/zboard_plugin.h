@@ -1,9 +1,16 @@
 /* zboard_plugin.h: a Zorro expansion board as a plugin for an Amiga emulator. Interface version 1.
  *
  * The plugin is the whole board: its registers, memory, timing, display and whatever it does on the side
- * (Zorro2RTG: the link to a real Nano 20K, the USB input queue, traces). The emulator (the host) keeps what
- * only it can do: mapping memory banks, charging bus time to the CPU, raising interrupt levels and showing
- * frames. Nothing here names an emulator type, so the same plugin can serve Amiberry, WinUAE or a test.
+ * (Zorro2RTG: the USB input queue, traces). The emulator (the host) keeps what only it can do: mapping
+ * memory banks, charging bus time to the CPU, raising interrupt levels and showing frames. Nothing here
+ * names an emulator type, so the same plugin can serve Amiberry, WinUAE or a test.
+ *
+ * Outside hardware (Zorro2RTG: a real Nano 20K the emulated board mirrors to) is never reached by the
+ * plugin itself. The host holds one connection to a daemon per board and gives the plugin a message
+ * channel over it (zbp_host.send and recv); in the daemon, the board's peer (zbp_desc.peer) gets the
+ * messages and talks to the hardware. The model stays in the emulator, so reads never wait for a round
+ * trip; only the messages leave. The messages are the plugin's and its peer's own: the host and the
+ * daemon pass them on unread.
  *
  * Use, either compiled in or loaded with dlopen:
  *   const zbp_api *api = zbp_get_api(ZBP_VERSION);   NULL: the plugin doesn't speak this version
@@ -68,6 +75,9 @@ typedef struct zbp_desc {
     uint32_t flags;                 /* ZBP_DESC_* */
     uint32_t n_regions;
     const zbp_region *regions;      /* sorted, covering 0 to size - 1 without gaps */
+    /* the board's peer in the daemon, a name of [a-z0-9_] ("zorro2rtg"), or NULL for none; the host
+       connects only when its user asks for the daemon */
+    const char *peer;
 } zbp_desc;
 
 enum {
@@ -87,7 +97,20 @@ typedef struct zbp_host {
     /* the board's display wants to be shown (on) or gives the monitor back to the chipset (off) */
     void (*display)(void *ctx, int on);
     void (*log)(void *ctx, int level, const char *msg);
+
+    /* The channel to the board's peer in the daemon (zbp_desc.peer). Messages arrive whole and in order,
+       1 to ZBP_MSG_MAX bytes. The host opens it before configured() and again before each later
+       configured(), so a lost daemon is retried at the Amiga's next reset. */
+    /* nonzero while the channel is open */
+    int (*channel_up)(void *ctx);
+    /* queue a message for the peer; 0 when there is no channel (the message is dropped). Waits while the
+       host's outgoing buffer is full, so a peer that cannot keep up slows the emulated board down */
+    int (*send)(void *ctx, const void *msg, uint32_t len);
+    /* the next message from the peer into buf: its length, 0 when there is none */
+    uint32_t (*recv)(void *ctx, void *buf, uint32_t cap);
 } zbp_host;
+
+#define ZBP_MSG_MAX 65536u          /* the longest message either way (recv's buf needs this much) */
 
 /* ---- Frames ----------------------------------------------------------------------------------------- */
 
