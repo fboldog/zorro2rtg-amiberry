@@ -72,7 +72,8 @@ The pointer's position is not queued with the other registers: each message carr
 one `P` record, and the peer sends it ahead of the writes it still has queued (not during a blitter wait),
 so the real pointer keeps up while the real board is still drawing a listing or a drag.
 
-The peer (`peer.py`) turns runs into bridge bursts of 256 words, acknowledges each message once its last
+The peer (`peer.py`) turns runs into bridge bursts of 256 words and consecutive runs of one or two words into
+scatter writes (`M`, up to 102 words a command), acknowledges each message once its last
 record has gone to the daemon, waits at a barrier for the real `BLT_BUSY`, polls the input queue every 5 ms
 (no bursts while a poll runs), and resends refused bursts once the daemon is back in step. The daemon queues
 its commands with every other client's (the main project's `docs/debug_bridge.md`), so a host tool that holds
@@ -89,6 +90,7 @@ The bridge protocol the peer speaks (the main project's `docs/debug_bridge.md`):
 | Read word | `R a2 a1 a0` | 2 bytes |
 | Burst write | `B a2 a1 a0 n` + n+1 words | `k` |
 | Burst read | `S a2 a1 a0 n` | n+1 words |
+| Scatter write | `M n` + n+1 × `a2 a1 a0 dH dL` | `k` (gateware of 2026-11-21 or later) |
 
 Values are big-endian; the offset is the 24-bit offset in the 4 MB board window, and `e` means refused.
 

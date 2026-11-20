@@ -3,7 +3,10 @@
 the loop that talks to the real Nano 20K over its UART debug bridge (docs/debug_bridge.md). The plugin's half
 (z2rtg_link.h) sends the emulated board's write stream as messages; this peer turns them into bridge commands.
 
-- Writes: each 'W' run becomes bursts ('B') of up to BURST words, in the stream's order. At most OUT_BYTES
+- Writes: each 'W' run becomes bursts ('B') of up to BURST words, in the stream's order. Consecutive short
+  runs (up to SCATTER_RUN words: a vertical line drawn by the CPU, one word per row) go as one scatter write
+  ('M', up to SCATTER words, each at an offset of its own) instead of a burst each, so they cost bytes on the
+  line, not a command and a reply each. At most OUT_BYTES
   and OUT_CMDS of this peer's commands wait in the daemon at a time, so an input poll never queues behind a
   whole redraw. Both limits sit a little above the daemon's UART window (WINDOW_BYTES, WINDOW_CMDS), which
   keeps many short commands in flight, so 1-word bursts (a vertical line drawn by the CPU, as in a window
@@ -43,6 +46,8 @@ IN_STATUS, IN_POP, IN_POP_POP = REGS["REG_IN_STATUS"], REGS["REG_IN_POP"], REGS[
 IN_AVAIL, IN_OVF, IN_FERR = REGS["IN_STATUS_AVAIL"], REGS["IN_STATUS_OVERFLOW"], REGS["IN_STATUS_FRAME_ERR"]
 
 BURST = 256            # words per bridge burst
+SCATTER_RUN = 2        # runs this short go in a scatter write ('M')
+SCATTER = 102          # words per scatter write: 512 bytes of entries, a burst's size on the line
 OUT_BYTES = 5 * 517    # bytes of this peer's commands waiting in the daemon (its UART window is 4 * 517)
 OUT_CMDS = 40          # and commands (its UART window is 32)
 INPUT_EVERY = 0.005    # input poll period
@@ -54,6 +59,14 @@ REPORT_EVERY = 10.0
 
 def a3(off):
     return (off & 0xFFFFFF).to_bytes(3, "big")
+
+
+def has_blt_op(cmd):
+    """whether a write command ('B' or 'M') writes BLT_OP"""
+    if cmd[:1] == b"M":
+        return any(int.from_bytes(cmd[2 + 5 * i:5 + 5 * i], "big") & ~1 == BLT_OP for i in range(cmd[1] + 1))
+    off = int.from_bytes(cmd[1:4], "big")
+    return off <= BLT_OP < off + 2 * (cmd[4] + 1)
 
 
 class Peer:
@@ -139,9 +152,8 @@ class Peer:
                     self.api.log(f"{len(retry)} bursts dropped after {RESEND_TRIES} attempts; the real board is "
                                  "out of step")
                     break
-                off = int.from_bytes(cmd[1:4], "big")
-                if off <= BLT_OP < off + 2 * (cmd[4] + 1):
-                    self.api.log("resending a burst with BLT_OP: the job may run twice")
+                if has_blt_op(cmd):
+                    self.api.log("resending a write with BLT_OP: the job may run twice")
                 self.burst(cmd, tries + 1)
                 self.stats["resent"] += 1
             return
@@ -169,6 +181,9 @@ class Peer:
                 self.barrier = "drain"
                 return self.run(now)
             _, off, data = item
+            if len(data) // 2 <= SCATTER_RUN:
+                self.scatter()
+                continue
             n = min(BURST, len(data) // 2)
             self.burst(b"B" + a3(off) + bytes([n - 1]) + data[:2 * n], 0)
             self.backlog_words -= n
@@ -196,6 +211,21 @@ class Peer:
         self.report(None)
 
     # ---- bridge commands and their replies
+    def scatter(self):
+        """consecutive short runs at the head of the queue as one 'M' command"""
+        entries = []
+        while self.q and self.q[0][0] == b"W" and len(self.q[0][2]) // 2 <= SCATTER_RUN:
+            _, off, data = self.q[0]
+            n = len(data) // 2
+            if len(entries) + n > SCATTER:
+                break
+            entries += [a3(off + 2 * i) + data[2 * i:2 * i + 2] for i in range(n)]
+            self.q.popleft()
+            self.backlog_words -= n
+        self.stats["words"] += len(entries)
+        self.stats["scatters"] += 1
+        self.burst(b"M" + bytes([len(entries) - 1]) + b"".join(entries), 0)
+
     def burst(self, cmd, tries):
         entry = [cmd, tries]
         self.sent.append(entry)
@@ -271,7 +301,7 @@ class Peer:
         self.reported = snap
         s = self.stats
         line = (f"{s['words']} words in {s['bursts']} bursts, {s['polls']} blitter waits, {s['errors']} errors, "
-                f"{s['resent']} bursts resent, {s['pointer']} pointer moves, {self.backlog_words} words waiting")
+                f"{s['resent']} bursts resent, {s['scatters']} scatter writes, {s['pointer']} pointer moves, {self.backlog_words} words waiting")
         if self.input:
             line += (f"; input {s['events']} events, {s['overflows']} overflows, {s['frame_errors']} frame errors, "
                      f"{s['input_errors']} refused reads, {s['in_polls']} polls")
