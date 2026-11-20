@@ -1,9 +1,13 @@
 /*
- * Amiberry adapter for a zboard plugin (include/zboard_plugin.h), here the Zorro2RTG board in
- * plugins/zorro2rtg/z2rtg_plugin.cpp, compiled in. Only what needs Amiberry is here: the memory banks, bus time charged to
- * the CPU, /INT2, switching the display between the chipset and the board, and copying its frames to the
- * RTG surface. Everything the board does, its options included, is in the plugin (z2rtg_plugin.cpp).
+ * Amiberry adapter for a zboard plugin (include/zboard_plugin.h), compiled in with the plugin that
+ * integrate.py copies next to it (today plugins/zorro2rtg). It names no board: the bank names come from the
+ * plugin's regions and the label from its description. Only what needs Amiberry is here: the memory banks,
+ * bus time charged to the CPU, interrupts, switching the display between the chipset and the board, and
+ * copying its frames to the RTG surface. Everything the board does, its options included, is in the plugin.
  *
+ * - It is an RTG board adapter: Amiberry runs it as a gfxboard (an RTG board slot, gfxboard_set for the
+ *   display). A board without ZBP_DESC_DISPLAY is served too, but never shows a picture; a board that is not
+ *   an RTG card belongs in a second adapter on expansion.cpp, or in an Amiberry plugin loader.
  * - The board's IO regions use the I/O bank gfxboard.cpp maps at Autoconfig; its RAM regions (VRAM and
  *   staging) get a RAM bank with a direct pointer, as the ZZ9000 model maps its VRAM. Every access still
  *   goes through the plugin. Longwords are two word cycles, high word first, as on Zorro II.
@@ -49,6 +53,16 @@ struct zb_state {
 };
 
 static zb_state *zb_boards[MAX_RTG_BOARDS];
+
+// The banks are shared by every board this adapter serves; one plugin is compiled in, so its region names
+// label them (set in zb_init).
+static const char *zb_name(const zbp_desc *desc, uint32_t kind, const char *fallback)
+{
+    for (uint32_t i = 0; i < desc->n_regions; i++)
+        if (desc->regions[i].kind == kind && desc->regions[i].name)
+            return desc->regions[i].name;
+    return fallback;
+}
 
 static constexpr uint64_t LINE_NS = 64000, LINE_CCK = 227;
 
@@ -140,7 +154,7 @@ static int REGPARAM2 zb_check(uaecptr addr, uae_u32 size)
 static addrbank zb_ram_bank = {
     zb_lget, zb_wget, zb_bget,
     zb_lput, zb_wput, zb_bput,
-    zb_xlate, zb_check, nullptr, _T("*"), _T("Zorro2RTG VRAM"),
+    zb_xlate, zb_check, nullptr, _T("*"), _T("zboard RAM"),
     zb_lget, zb_wget,
     ABFLAG_RAM, S_READ, S_WRITE
 };
@@ -148,7 +162,7 @@ static addrbank zb_ram_bank = {
 static addrbank zb_io_bank = {
     zb_lget, zb_wget, zb_bget,
     zb_lput, zb_wput, zb_bput,
-    default_xlate, default_check, nullptr, nullptr, _T("Zorro2RTG"),
+    default_xlate, default_check, nullptr, nullptr, _T("zboard"),
     zb_lget, zb_wget,
     ABFLAG_IO, S_READ, S_WRITE
 };
@@ -168,7 +182,7 @@ static void zb_hsync(void *userdata)
 static bool zb_vsync(void *userdata, gfxboard_mode *mode)
 {
     auto *d = static_cast<zb_state *>(userdata);
-    if (!d->base || !d->enabled)
+    if (!d->base || !d->enabled || !(d->api->desc->flags & ZBP_DESC_DISPLAY))
         return false;
     zbp_frame f {};
     f.struct_size = sizeof f;
@@ -202,7 +216,7 @@ static bool zb_vsync(void *userdata, gfxboard_mode *mode)
 static bool zb_toggle(void *userdata, int mode)
 {
     auto *d = static_cast<zb_state *>(userdata);
-    if (!d->base)
+    if (!d->base || !(d->api->desc->flags & ZBP_DESC_DISPLAY))
         return false;
     if (!mode) {
         if (!d->enabled)
@@ -261,6 +275,8 @@ static bool zb_init(autoconfig_info *aci)
         return false;
     }
     aci->label = api->desc->name;
+    zb_io_bank.name = zb_name(api->desc, ZBP_REGION_IO, api->desc->name);
+    zb_ram_bank.name = zb_name(api->desc, ZBP_REGION_RAM, api->desc->name);
     if (!aci->doinit)
         return true;
     auto *d = new (std::nothrow) zb_state{};
@@ -285,7 +301,7 @@ static bool zb_init(autoconfig_info *aci)
     return true;
 }
 
-gfxboard_func zorro2rtg_func = {
+gfxboard_func zboard_func = {
     zb_init,
     zb_free,
     zb_reset,

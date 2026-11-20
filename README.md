@@ -23,7 +23,7 @@ Licence: GPL-3.0-or-later (`LICENSE`).
 | Path | What it is |
 |---|---|
 | `include/zboard_plugin.h` | The plugin interface: a Zorro board behind a versioned C interface that names no emulator type |
-| `hosts/amiberry/zorro2rtg.cpp` | Amiberry's adapter, using only the plugin interface: memory banks, CPU time and stalls, /INT2, display switching, frame copy |
+| `hosts/amiberry/zboard_amiberry.cpp` | Amiberry's adapter, using only the plugin interface and naming no board: memory banks, CPU time and stalls, /INT2, display switching, frame copy |
 | `hosts/amiberry/integrate.py` | Copies the adapter and the plugin into an Amiberry v8.5.0 tree and makes the small table edits (safe to run again) |
 | `hosts/amiberry/build.sh` | Clones v8.5.0 if needed, integrates, builds with CMake and Ninja |
 | `plugins/zorro2rtg/` | The Zorro2RTG board as a plugin (its own `README.md`) |
@@ -43,7 +43,7 @@ What is generic today and what is not:
 | Part | Generic | Limit |
 |---|---|---|
 | `zboard_plugin.h` | Yes: any Zorro board, emulator-neutral | Version 1: Zorro II only, 8- and 16-bit accesses, no save states. The `zorro` field already takes 3, but Zorro III needs a later version (32-bit accesses) |
-| Amiberry adapter (`hosts/amiberry/zorro2rtg.cpp`) | No: an RTG card adapter | Registers as a `gfxboard_func`, uses the RTG board slots (`rtgboards[]`, `MAX_RTG_BOARDS`) and `gfxboard_set`, and names its banks after Zorro2RTG. A board without a display would need a second adapter on `expansion.cpp` |
+| Amiberry adapter (`hosts/amiberry/zboard_amiberry.cpp`) | Names no board: bank names come from the plugin's regions, the label from its description | An RTG board adapter: registers as a `gfxboard_func` (`zboard_func`), uses the RTG board slots (`rtgboards[]`, `MAX_RTG_BOARDS`) and `gfxboard_set`. A board without `ZBP_DESC_DISPLAY` runs but never shows a picture; a board that is not an RTG card needs a second adapter on `expansion.cpp` or an Amiberry loader. One plugin at a time is compiled in |
 | `hosts/amiberry/integrate.py` | No | Adds Zorro2RTG's Autoconfig row and boot ROM fields to `gfxboard.cpp`, its board ID to a check in `expansion.cpp`, and its sources to the CMake list |
 | `plugins/zorro2rtg/` | No | The Zorro2RTG board itself |
 

@@ -1,6 +1,6 @@
 // Zorro2RTG as a zboard plugin (include/zboard_plugin.h): the board model (z2rtg_core), its timing, the
 // board-in-the-loop link (z2rtg_link), the USB input sources, the boot ROM, the traces and the finished
-// frame. Emulator-independent; hosts/amiberry/zorro2rtg.cpp is Amiberry's adapter to it.
+// frame. Emulator-independent; hosts/amiberry/zboard_amiberry.cpp is Amiberry's adapter to it.
 //
 // Time: the model's 64 us lines (blitter busy time, vertical blank, FRAME_COUNT) follow the host's time,
 // passed with every call, so BLT_BUSY resolves to the CPU cycle inside a line.
