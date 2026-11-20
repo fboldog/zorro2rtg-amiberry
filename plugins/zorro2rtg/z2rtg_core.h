@@ -1,6 +1,6 @@
 // Zorro2RTG board model, emulator-independent core (docs/driver.md).
 // The register file, scanout state, 8 MB VRAM and blitter of the gateware, as docs/registers.md defines
-// them. Offsets and bit positions come from include/zorro2rtg_regs.h, a copy of the generated sw/p96/zorro2rtg_regs.h.
+// them. Offsets and bit positions come from zorro2rtg_regs.h (here), a copy of the generated sw/p96/zorro2rtg_regs.h.
 // SPDX-License-Identifier: GPL-3.0-or-later
 #ifndef Z2RTG_CORE_H
 #define Z2RTG_CORE_H

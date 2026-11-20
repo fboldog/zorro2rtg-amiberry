@@ -1,16 +1,17 @@
 # Zorro2RTG board for Amiberry
 
-An emulated Zorro2RTG card for [Amiberry](https://github.com/BlitterStudio/amiberry) v8.5.0. Zorro2RTG is a
-Zorro II RTG card built on a Sipeed Tang Nano 20K (the Zorro2-Tang25k project). The emulated board implements
-the card's register map:
-- registers, palette and cursor image;
-- 8 MB VRAM with BANK;
-- scanout in every gateware mode, RGB565 and CLUT8;
-- the hardware cursor and the blitter;
-- the USB input queue and the boot ROM window.
+This repo has two parts:
+- **A board plugin interface** (`include/zboard_plugin.h`): any Zorro expansion board behind a versioned C
+  interface that names no emulator type. An RTG card is one kind of board; a RAM, I/O or controller board
+  fits the same interface, since producing frames is optional (`ZBP_DESC_DISPLAY`).
+- **The Zorro2RTG board as its first plugin**, with an adapter for
+  [Amiberry](https://github.com/BlitterStudio/amiberry) v8.5.0.
 
-Its own Picasso96 and PrismRTG drivers run on it unchanged. It can also mirror everything the emulated Amiga
-writes to a real Nano 20K, so the real card's HDMI output shows the emulated Workbench ("board in the loop").
+Zorro2RTG is a Zorro II RTG card built on a Sipeed Tang Nano 20K (the Zorro2-Tang25k project); its
+emulated board runs the card's own Picasso96 and PrismRTG drivers unchanged (`plugins/zorro2rtg/README.md`).
+
+The repo's name comes from the time before the interface; it may change when the plugin loader is proposed
+to Amiberry upstream.
 
 Paths such as `docs/registers.md` or `sw/p96/` in the comments refer to the Zorro2-Tang25k project, which
 uses this repo as the submodule `sw/emu/zorro2rtg-amiberry`.
@@ -22,14 +23,10 @@ Licence: GPL-3.0-or-later (`LICENSE`).
 | Path | What it is |
 |---|---|
 | `include/zboard_plugin.h` | The plugin interface: a Zorro board behind a versioned C interface that names no emulator type |
-| `src/z2rtg_plugin.cpp` | The Zorro2RTG board as that plugin: the model, its timing and bus time, the link, USB input, boot ROM, traces and finished frames; its options |
-| `src/zorro2rtg.cpp` | Amiberry's adapter, using only the plugin interface: memory banks, CPU time and stalls, /INT2, display switching, frame copy |
-| `src/z2rtg_core.{h,cpp}` | The board model, independent of any emulator |
-| `src/z2rtg_capi.cpp` | C interface to the model, for host tests |
-| `src/z2rtg_link.{h,cpp}` | Board-in-the-loop link: the model's write stream to a real board, over its serial port or a Unix socket |
-| `include/zorro2rtg_regs.h` | Register map header, a copy of the file generated in the main project (`sw/gen_regs.py`) |
-| `integrate.py` | Copies the board into an Amiberry v8.5.0 tree and makes the small table edits (safe to run again) |
-| `build.sh` | Clones v8.5.0 if needed, integrates, builds with CMake and Ninja |
+| `hosts/amiberry/zorro2rtg.cpp` | Amiberry's adapter, using only the plugin interface: memory banks, CPU time and stalls, /INT2, display switching, frame copy |
+| `hosts/amiberry/integrate.py` | Copies the adapter and the plugin into an Amiberry v8.5.0 tree and makes the small table edits (safe to run again) |
+| `hosts/amiberry/build.sh` | Clones v8.5.0 if needed, integrates, builds with CMake and Ninja |
+| `plugins/zorro2rtg/` | The Zorro2RTG board as a plugin (its own `README.md`) |
 
 ## The plugin interface
 
@@ -41,6 +38,15 @@ picture). The host passes its emulated time in ns with every call and supplies t
 time, switch the display, log. Version 1 is Zorro II only and has no save states, since a board in the loop
 depends on the real board's state.
 
+What is generic today and what is not:
+
+| Part | Generic | Limit |
+|---|---|---|
+| `zboard_plugin.h` | Yes: any Zorro board, emulator-neutral | Version 1: Zorro II only, 8- and 16-bit accesses, no save states. The `zorro` field already takes 3, but Zorro III needs a later version (32-bit accesses) |
+| Amiberry adapter (`hosts/amiberry/zorro2rtg.cpp`) | No: an RTG card adapter | Registers as a `gfxboard_func`, uses the RTG board slots (`rtgboards[]`, `MAX_RTG_BOARDS`) and `gfxboard_set`, and names its banks after Zorro2RTG. A board without a display would need a second adapter on `expansion.cpp` |
+| `hosts/amiberry/integrate.py` | No | Adds Zorro2RTG's Autoconfig row and boot ROM fields to `gfxboard.cpp`, its board ID to a check in `expansion.cpp`, and its sources to the CMake list |
+| `plugins/zorro2rtg/` | No | The Zorro2RTG board itself |
+
 Amiberry has no loader for expansion boards, so the board is compiled in, like its other gfxboards, and
 `integrate.py` adds its Autoconfig row to `gfxboard.cpp`, which must match the plugin's description. A loader
 that builds the row from the description is an Amiberry change for later.
@@ -48,54 +54,19 @@ that builds the row from the description is an Amiberry change for later.
 ## Build
 
 ```
-./build.sh [AMIBERRY_SRC]      # default ~/amiberry-zorro2/src; the binary is AMIBERRY_SRC/build/amiberry
+hosts/amiberry/build.sh [AMIBERRY_SRC]      # default ~/amiberry-zorro2/src; the binary is AMIBERRY_SRC/build/amiberry
 ```
 
 Select the board in the config with `gfxcard_type=Zorro2RTG` and `gfxcard_size=4` (or the GUI's RTG board
 list). It is a 4 MB Zorro II board.
 
-## Environment options
+## Plugins
 
-| Variable | Effect |
+| Plugin | Board |
 |---|---|
-| `Z2RTG_BRIDGE` | Mirror every write to a real board. `/dev/ttyUSBn` uses the Nano's serial port directly. `unix:PATH`, or a path that is a socket, goes through `z2bridged.py`, so other programs can use the board meanwhile |
-| `Z2RTG_BRIDGE_BAUD` | Serial port only, default 3000000 |
-| `Z2RTG_INPUT` | `FIFO`: single-wire link frames from a named pipe. `bridge`: events from the real board's USB input queue |
-| `Z2RTG_BOOTROM` | The boot ROM image for the BOOTROM window |
-| `Z2RTG_BUS=0` | No Zorro II bus time charged per access |
-| | Each variable `Z2RTG_<KEY>` is also the plugin option `key=value` (create's option string, which the Amiberry adapter leaves empty for now) |
-| `Z2RTG_TRACE`, `Z2RTG_TRACE_BLT`, `Z2RTG_TRACE_TPL`, `Z2RTG_TRACE_FILE`, `Z2RTG_NOCURSOR` | Debugging |
-
-## The link's socket
-
-The socket carries the Nano 20K debug bridge's own byte protocol (the main project's `docs/debug_bridge.md`):
-
-| Command | Bytes sent | Reply |
-|---|---|---|
-| Ping | `?` | `Z` |
-| Write word | `W a2 a1 a0 dH dL` | `k` |
-| Read word | `R a2 a1 a0` | 2 bytes |
-| Burst write | `B a2 a1 a0 n` + n+1 words | `k` |
-| Burst read | `S a2 a1 a0 n` | n+1 words |
-
-Values are big-endian; the offset is the 24-bit offset in the 4 MB board window, and `e` means refused. The
-same link code therefore drives a serial port or the daemon unchanged. The daemon adds `L` and `U`, with which a
-host tool holds the board for a while; the link never sends them, but its commands then wait in the daemon, so
-through a socket it waits up to 10 minutes for a reply and the emulation stalls meanwhile. A refused command
-gets a lone `e`, also where a read's data should be, and the link takes that as the whole reply. The link's
-queue is bounded (524,288 writes): when it is full, the emulated board's next write waits. On exit, the link
-gives the queue 2 s, then stops waiting for replies.
-
-The daemon `sw/tools/host/z2bridged.py` lives in the main project. It owns the serial port and passes whole
-commands from several clients to it in order. When the bridge refuses something, it answers `e` for every
-command that was dropped.
-
-Reads are always answered by the emulated board and never forwarded, since a USB round trip takes about 1 ms.
+| [`plugins/zorro2rtg`](plugins/zorro2rtg/README.md) | Zorro2RTG, a Zorro II RTG card: its options, the board-in-the-loop link and its tests |
 
 ## Tests
 
-The host tests live in the main project (`make -C sim host`):
-- `sw/tests/test_z2rtg_core.py`: the model;
-- `sw/tests/test_zboard_plugin.py`: the board through the plugin interface, as a host uses it;
-- `sw/tests/test_z2rtg_link.py`: input polling during a long redraw;
-- `sw/tests/test_z2bridged.py`: the link through the daemon, together with a second client.
+The host tests live in the main project (`make -C sim host`). `sw/tests/test_zboard_plugin.py` drives a board
+through the plugin interface, as a host uses it; the Zorro2RTG plugin's own tests are in its `README.md`.

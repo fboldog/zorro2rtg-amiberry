@@ -1,6 +1,6 @@
 /*
  * Amiberry adapter for a zboard plugin (include/zboard_plugin.h), here the Zorro2RTG board in
- * z2rtg_plugin.cpp, compiled in. Only what needs Amiberry is here: the memory banks, bus time charged to
+ * plugins/zorro2rtg/z2rtg_plugin.cpp, compiled in. Only what needs Amiberry is here: the memory banks, bus time charged to
  * the CPU, /INT2, switching the display between the chipset and the board, and copying its frames to the
  * RTG surface. Everything the board does, its options included, is in the plugin (z2rtg_plugin.cpp).
  *

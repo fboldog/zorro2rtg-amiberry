@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adds the Zorro2RTG board to an Amiberry v8.5.0 source tree (README.md).
+"""Adds the Zorro2RTG board to an Amiberry v8.5.0 source tree (README.md in the repo root).
     integrate.py AMIBERRY_SRC
 Copies the board model in and makes a few small edits, each skipped if already present, so it can be
 run again. Fails if an anchor line is missing (a different Amiberry version)."""
@@ -7,7 +7,9 @@ import pathlib
 import shutil
 import sys
 
-HERE = pathlib.Path(__file__).resolve().parent
+HERE = pathlib.Path(__file__).resolve().parent   # hosts/amiberry
+REPO = HERE.parents[1]
+PLUGIN = REPO / "plugins" / "zorro2rtg"
 
 
 def edit(path, anchor, insert, after=True, marker=None):
@@ -34,10 +36,12 @@ def replace(path, old, new):
 
 def main():
     src = pathlib.Path(sys.argv[1]).resolve()
-    for f in ("zorro2rtg.cpp", "z2rtg_plugin.cpp", "z2rtg_core.cpp", "z2rtg_link.cpp"):
-        shutil.copy(HERE / "src" / f, src / "src" / f)
-    for f in ("src/z2rtg_core.h", "src/z2rtg_link.h", "include/zorro2rtg_regs.h", "include/zboard_plugin.h"):
-        shutil.copy(HERE / f, src / "src" / "include" / pathlib.Path(f).name)
+    shutil.copy(HERE / "zorro2rtg.cpp", src / "src" / "zorro2rtg.cpp")
+    for f in ("z2rtg_plugin.cpp", "z2rtg_core.cpp", "z2rtg_link.cpp"):
+        shutil.copy(PLUGIN / f, src / "src" / f)
+    for f in (PLUGIN / "z2rtg_core.h", PLUGIN / "z2rtg_link.h", PLUGIN / "zorro2rtg_regs.h",
+              REPO / "include" / "zboard_plugin.h"):
+        shutil.copy(f, src / "src" / "include" / f.name)
     h = src / "src/include/gfxboard.h"
     edit(h, "#define GFXBOARD_ID_ZZ9000_Z3 44\n", "#define GFXBOARD_ID_ZORRO2RTG 45\n")
     edit(h, "extern struct gfxboard_func zz9000_func;\n", "extern struct gfxboard_func zorro2rtg_func;\n")
