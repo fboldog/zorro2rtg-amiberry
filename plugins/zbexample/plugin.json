@@ -1,0 +1,14 @@
+{
+    "name": "zbexample",
+    "description": "zbexample, the example board of docs/writing-a-plugin.md: a 64 KB Zorro II packet mailbox",
+    "sources": ["zbexample_plugin.cpp"],
+    "headers": [],
+    "amiberry": {
+        "adapter": "expansion",
+        "expansion": {
+            "config_name": "zbexample",
+            "name": "zbexample (zboard example)",
+            "manufacturer_name": "Zorro2-Tang25k"
+        }
+    }
+}

@@ -1,0 +1,32 @@
+{
+    "name": "zorro2rtg",
+    "description": "Zorro2RTG, a Zorro II RTG card (the Zorro2-Tang25k project)",
+    "sources": ["z2rtg_plugin.cpp", "z2rtg_core.cpp", "z2rtg_link.cpp"],
+    "headers": ["z2rtg_core.h", "z2rtg_link.h", "zorro2rtg_regs.h"],
+    "amiberry": {
+        "adapter": "rtg",
+        "rtg": {
+            "id": 45,
+            "id_name": "GFXBOARD_ID_ZORRO2RTG",
+            "name": "Zorro2RTG [Zorro II]",
+            "manufacturer_name": "Zorro2-Tang25k",
+            "config_name": "Zorro2RTG",
+            "manufacturer": "0x5a32",
+            "model_memory": 1,
+            "model_registers": 0,
+            "model_extra": 0,
+            "serial": "0x00000001",
+            "vram_min": "0x00400000",
+            "vram_max": "0x00400000",
+            "bank_size": "0x00400000",
+            "chiptype": 0,
+            "configtype": 2,
+            "irq": 2,
+            "swap": false,
+            "hasswitcher": true,
+            "romtype": 0,
+            "er_type": "0xd7",
+            "diag_vec": "0x8000"
+        }
+    }
+}

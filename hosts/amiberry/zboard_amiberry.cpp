@@ -1,27 +1,15 @@
 /*
- * Amiberry adapter for a zboard plugin (include/zboard_plugin.h), compiled in with the plugin that
- * integrate.py copies next to it (today plugins/zorro2rtg). It names no board: the bank names come from the
- * plugin's regions and the label from its description. Only what needs Amiberry is here: the memory banks,
- * bus time charged to the CPU, interrupts, switching the display between the chipset and the board, and
- * copying its frames to the RTG surface. Everything the board does, its options included, is in the plugin.
- *
- * - It is an RTG board adapter: Amiberry runs it as a gfxboard (an RTG board slot, gfxboard_set for the
- *   display). A board without ZBP_DESC_DISPLAY is served too, but never shows a picture; a board that is not
- *   an RTG card belongs in a second adapter on expansion.cpp, or in an Amiberry plugin loader.
- * - The board's IO regions use the I/O bank gfxboard.cpp maps at Autoconfig; its RAM regions (VRAM and
- *   staging) get a RAM bank with a direct pointer, as the ZZ9000 model maps its VRAM. Every access still
- *   goes through the plugin. Longwords are two word cycles, high word first, as on Zorro II.
- * - Time: the plugin gets the emulated CPU time in ns with every call, from get_cycles() at 227 colour
- *   clocks per 64 us line, so the model's lines stay in step with the chipset's.
+ * Amiberry adapter for a zboard plugin that is an RTG card (include/zboard_plugin.h, ZBP_DESC_DISPLAY), compiled
+ * in with the plugin that integrate.py copies next to it (its plugin.json says "adapter": "rtg"). It names no
+ * board: the bank names come from the plugin's regions and the label from its description. What both adapters
+ * share (time, bus time, banks, interrupts, the daemon channel) is in zboard_amiberry_common.h; this file is
+ * what an RTG card needs on top: Amiberry runs it as a gfxboard (an RTG board slot, gfxboard_set for the
+ * display), switches the display between the chipset and the board, and copies its frames to the RTG surface.
+ * A Zorro board that is not an RTG card uses zboard_expansion.cpp instead.
+ * - The Autoconfig data is the board's row in gfxboard.cpp, added by integrate.py from plugin.json; it must
+ *   match the plugin's zbp_desc. (The expansion adapter builds it from zbp_desc itself.)
  * - The hsync callback ticks the plugin every line (it runs every line after the boot reset and after a
- *   reboot, instrumented on v8.5.0 on 2026-11-14); the levels it returns are raised as long as it requests
- *   them, since /INT2 is level-triggered.
- * - The Autoconfig data is the board's row in gfxboard.cpp, added by integrate.py; it must match the
- *   plugin's zbp_desc. A loader that reads the description instead is for a later Amiberry change.
- * - The daemon: with ZBOARD_DAEMON set (unix:PATH, a path, or "default" for z2bridged's default socket;
- *   unset or "none": no daemon), the adapter opens the plugin's channel to its peer (zbp_desc.peer) at each
- *   Autoconfig, before configured(), through hosts/common/zboard_channel. The plugin itself never opens a
- *   port. Channel messages go to Amiberry's log and to stderr.
+ *   reboot, instrumented on v8.5.0 on 2026-11-14).
  *
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -38,57 +26,8 @@
 #include "newcpu.h"
 #include "devices.h"
 
-#include <cstddef>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <new>
-#include <string>
-
-#include "zboard_plugin.h"
-#include "zboard_channel.h"
-
-struct zb_state {
-    const zbp_api *api = nullptr;
-    zbp_board *b = nullptr;
-    zbp_host host {};
-    int devnum = -1;
-    int monitor_id = 0;
-    uae_u32 base = 0;            // configured address, 0 before Autoconfig
-    uae_u32 size = 0;
-    bool enabled = false;        // Amiberry has this board's display selected (toggle)
-    bool rtg_on = false;         // what the board last asked for (host.display)
-    bool mode_changed = true;
-    int shown_w = 0, shown_h = 0;
-    ZbChannel ch;                // to the board's peer in the daemon (ZBOARD_DAEMON)
-};
-
-static zb_state *zb_boards[MAX_RTG_BOARDS];
-
-// The banks are shared by every board this adapter serves; one plugin is compiled in, so its region names
-// label them (set in zb_init).
-static const char *zb_name(const zbp_desc *desc, uint32_t kind, const char *fallback)
-{
-    for (uint32_t i = 0; i < desc->n_regions; i++)
-        if (desc->regions[i].kind == kind && desc->regions[i].name)
-            return desc->regions[i].name;
-    return fallback;
-}
-
-static constexpr uint64_t LINE_NS = 64000, LINE_CCK = 227;
-
-// emulated time in ns: colour clocks at 227 per 64 us line
-static uint64_t zb_now()
-{
-    return static_cast<uint64_t>(static_cast<unsigned __int128>(get_cycles()) * LINE_NS / (LINE_CCK * CYCLE_UNIT));
-}
-
-static void zb_charge(void *, uint32_t ns)
-{
-    const evt_t cck = (static_cast<evt_t>(ns) * LINE_CCK + LINE_NS / 2) / LINE_NS;
-    if (cck)
-        x_do_cycles(cck * CYCLE_UNIT);
-}
+#define ZB_MAX_BOARDS MAX_RTG_BOARDS
+#include "zboard_amiberry_common.h"
 
 static void zb_display(void *ctx, int on)
 {
@@ -98,128 +37,9 @@ static void zb_display(void *ctx, int on)
     gfxboard_set(d->monitor_id, d->rtg_on);
 }
 
-static void zb_log(void *, int, const char *msg)
-{
-    write_log(_T("%s\n"), msg);
-}
-
-static int zb_channel_up(void *ctx)
-{
-    return static_cast<zb_state *>(ctx)->ch.up();
-}
-
-static int zb_send(void *ctx, const void *msg, uint32_t len)
-{
-    return static_cast<zb_state *>(ctx)->ch.send(msg, len);
-}
-
-static uint32_t zb_recv(void *ctx, void *buf, uint32_t cap)
-{
-    return static_cast<zb_state *>(ctx)->ch.recv(buf, cap);
-}
-
-// the plugin's peer, when its description names one and the user asked for the daemon
-static void zb_open_channel(zb_state *d)
-{
-    const zbp_desc *desc = d->api->desc;
-    const char *spec = getenv("ZBOARD_DAEMON");
-    if (!spec || !*spec || !strcmp(spec, "none") || d->ch.up())
-        return;
-    if (desc->struct_size < offsetof(zbp_desc, peer) + sizeof desc->peer || !desc->peer) {
-        write_log(_T("zboard: %s has no peer for the daemon\n"), desc->name);
-        return;
-    }
-    d->ch.open(spec, desc->peer, [](int, const std::string &m) {
-        write_log(_T("%s\n"), m.c_str());
-        fprintf(stderr, "%s\n", m.c_str());
-    });
-}
-
-static zb_state *zb_find(uaecptr addr)
-{
-    for (auto *d : zb_boards)
-        if (d && d->base && addr >= d->base && addr < d->base + d->size)
-            return d;
-    return nullptr;
-}
-
-static uae_u32 REGPARAM2 zb_wget(uaecptr addr)
-{
-    zb_state *d = zb_find(addr);
-    return d ? d->api->read(d->b, addr - d->base, 2, zb_now()) : 0;
-}
-static uae_u32 REGPARAM2 zb_lget(uaecptr addr)
-{
-    return (zb_wget(addr) << 16) | zb_wget(addr + 2);
-}
-static uae_u32 REGPARAM2 zb_bget(uaecptr addr)
-{
-    zb_state *d = zb_find(addr);
-    return d ? d->api->read(d->b, addr - d->base, 1, zb_now()) : 0;
-}
-static void REGPARAM2 zb_wput(uaecptr addr, uae_u32 v)
-{
-    if (zb_state *d = zb_find(addr))
-        d->api->write(d->b, addr - d->base, v & 0xffff, 2, zb_now());
-}
-static void REGPARAM2 zb_lput(uaecptr addr, uae_u32 v)
-{
-    zb_wput(addr, v >> 16);
-    zb_wput(addr + 2, v & 0xffff);
-}
-static void REGPARAM2 zb_bput(uaecptr addr, uae_u32 v)
-{
-    if (zb_state *d = zb_find(addr))
-        d->api->write(d->b, addr - d->base, v & 0xff, 1, zb_now());
-}
-static uae_u8 *REGPARAM2 zb_xlate(uaecptr addr)
-{
-    zb_state *d = zb_find(addr);
-    const uint8_t *p = d ? d->api->ptr(d->b, addr - d->base, 1) : nullptr;
-    // Amiberry's xlate is not const; the CPU only fetches through it
-    return p ? const_cast<uae_u8 *>(p) : default_xlate(addr);
-}
-static int REGPARAM2 zb_check(uaecptr addr, uae_u32 size)
-{
-    zb_state *d = zb_find(addr);
-    if (!d)
-        return 0;
-    const uae_u32 off = addr - d->base;
-    const zbp_desc *desc = d->api->desc;
-    for (uint32_t i = 0; i < desc->n_regions; i++) {
-        const zbp_region &r = desc->regions[i];
-        if (r.kind == ZBP_REGION_RAM && off >= r.offset && size <= r.size && off - r.offset <= r.size - size)
-            return 1;
-    }
-    return 0;
-}
-
-static addrbank zb_ram_bank = {
-    zb_lget, zb_wget, zb_bget,
-    zb_lput, zb_wput, zb_bput,
-    zb_xlate, zb_check, nullptr, _T("*"), _T("zboard RAM"),
-    zb_lget, zb_wget,
-    ABFLAG_RAM, S_READ, S_WRITE
-};
-
-static addrbank zb_io_bank = {
-    zb_lget, zb_wget, zb_bget,
-    zb_lput, zb_wput, zb_bput,
-    default_xlate, default_check, nullptr, nullptr, _T("zboard"),
-    zb_lget, zb_wget,
-    ABFLAG_IO, S_READ, S_WRITE
-};
-
 static void zb_hsync(void *userdata)
 {
-    auto *d = static_cast<zb_state *>(userdata);
-    if (!d->base)
-        return;
-    const uint32_t irq = d->api->tick(d->b, zb_now());
-    if (irq & (1u << 2))
-        safe_interrupt_set(IRQ_SOURCE_GFX, d->monitor_id, false);
-    if (irq & (1u << 6))
-        safe_interrupt_set(IRQ_SOURCE_GFX, d->monitor_id, true);
+    zb_tick(static_cast<zb_state *>(userdata));
 }
 
 static bool zb_vsync(void *userdata, gfxboard_mode *mode)
@@ -276,16 +96,7 @@ static bool zb_toggle(void *userdata, int mode)
 
 static void zb_configured(void *userdata, uae_u32 address)
 {
-    auto *d = static_cast<zb_state *>(userdata);
-    d->base = address;
-    zb_open_channel(d);         // the plugin sees the channel from configured() on
-    const zbp_desc *desc = d->api->desc;
-    for (uint32_t i = 0; i < desc->n_regions; i++) {
-        const zbp_region &r = desc->regions[i];
-        if (r.kind == ZBP_REGION_RAM)
-            map_banks(&zb_ram_bank, (address + r.offset) >> 16, r.size >> 16, 0);
-    }
-    d->api->configured(d->b, address, zb_now());
+    zb_set_configured(static_cast<zb_state *>(userdata), address);
 }
 
 static void zb_refresh(void *userdata)
@@ -301,27 +112,16 @@ static void zb_reset(void *userdata)
 
 static void zb_free(void *userdata)
 {
-    auto *d = static_cast<zb_state *>(userdata);
-    if (!d)
-        return;
-    if (d->devnum >= 0 && d->devnum < MAX_RTG_BOARDS)
-        zb_boards[d->devnum] = nullptr;
-    if (d->b)
-        d->api->destroy(d->b);  // the plugin flushes what it has into the channel
-    d->ch.close();
-    delete d;
+    if (auto *d = static_cast<zb_state *>(userdata))
+        zb_destroy(d);
 }
 
 static bool zb_init(autoconfig_info *aci)
 {
-    const zbp_api *api = zbp_get_api(ZBP_VERSION);
-    if (!api || api->struct_size < sizeof(zbp_api)) {
-        write_log(_T("zboard: plugin does not offer interface version %d\n"), ZBP_VERSION);
+    const zbp_api *api = zb_get_api();
+    if (!api)
         return false;
-    }
     aci->label = api->desc->name;
-    zb_io_bank.name = zb_name(api->desc, ZBP_REGION_IO, api->desc->name);
-    zb_ram_bank.name = zb_name(api->desc, ZBP_REGION_RAM, api->desc->name);
     if (!aci->doinit)
         return true;
     auto *d = new (std::nothrow) zb_state{};
@@ -331,13 +131,7 @@ static bool zb_init(autoconfig_info *aci)
     d->size = api->desc->size;
     d->devnum = aci->devnum;
     d->monitor_id = aci->prefs->rtgboards[aci->devnum].monitor_id;
-    d->host.struct_size = sizeof d->host;
-    d->host.charge_ns = zb_charge;
-    d->host.display = zb_display;
-    d->host.log = zb_log;
-    d->host.channel_up = zb_channel_up;
-    d->host.send = zb_send;
-    d->host.recv = zb_recv;
+    zb_host_init(d, zb_display);
     d->b = api->create(&d->host, d, "");   // options: the plugin's environment variables for now
     if (!d->b) {
         delete d;
