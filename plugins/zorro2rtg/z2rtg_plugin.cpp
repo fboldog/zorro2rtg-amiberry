@@ -50,9 +50,10 @@ constexpr uint32_t BUS_WRITE_NS = 564, BUS_READ_NS = 846; // 2 and 3 colour cloc
 constexpr uint32_t LINK_WAIT_BYTES = 16384;  // the bridge buffers 64 bytes (about 210 us at 3 Mbaud) while
                                              // a job holds its writes back; 16 KB is about 55 us
 constexpr uint32_t LINK_WAIT_ROWS = 64;      // taller jobs too: each row costs the real blitter a fixed
-                                             // setup however narrow it is, so a 1x708 border fill outlasts
-                                             // the next command and that BLT_OP is refused
-                                             // (STATUS.BLT_ERR). VERIFY the per-row cost
+                                             // setup however narrow it is (a 1x708 border fill). VERIFY the
+                                             // per-row cost. Smaller jobs need no wait: since 2026-11-21 the
+                                             // bridge holds its writes while a job runs, so they land after
+                                             // it; the wait only keeps its 64-byte FIFO from overflowing
 
 const zbp_region regions[] = {
     {0x000000, Z2R_VRAM_START, ZBP_REGION_IO, "Zorro2RTG"},

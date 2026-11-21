@@ -21,7 +21,8 @@
 //     real board is busy drawing (a directory listing scrolling).
 //   - wait_blitter() puts a barrier in the stream: the peer polls the real STATUS until BLT_BUSY clears
 //     before it sends anything after it. The emulated CPU waits on the model's BLT_BUSY, which the real
-//     board never sees, so a long job would otherwise still be running when the next writes arrive.
+//     board never sees. The real bridge holds its writes while a job runs (so they land after it), but it
+//     buffers only 64 bytes meanwhile, so a long job gets a barrier.
 //   - Reads are never forwarded: the model answers them.
 //   - With input on, the peer polls the real board's USB input queue (IN_*, docs/usb_input.md) and sends
 //     each event back. Writes to IN_* are then not forwarded, so the emulated driver's IN_POP never pops a
