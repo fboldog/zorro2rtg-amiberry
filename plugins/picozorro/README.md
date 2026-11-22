@@ -81,11 +81,13 @@ drops the DiagArea from the next reset.
 hosts/amiberry/build.sh ~/amiberry-picozorro/src picozorro      # an Amiberry with this plugin compiled in
 
 PICOZORRO_UART=/dev/serial/by-id/usb-Raspberry_Pi_Debugprobe_...-if01 \
-PICOZORRO_RTT_ELF=$PICOZORRO_SRC/firmware/target/backplane/picozorro.elf \
   .../Zorro2-Tang25k/zorro2-tang25k/sw/tools/host/z2bridged.py --port none --peers $PWD/plugins
 
 ZBOARD_DAEMON=default ~/amiberry-picozorro/src/build/amiberry -f a2000.uae   # with picozorro_rom_file=:ENABLED
 ```
+
+Networking on the emulated Amiga: [PrismNet.md](PrismNet.md) (the boot ROM's driver and the installer's disk
+copy, the interface, throughput).
 
 | Variable | Where | Default | Meaning |
 |---|---|---|---|
