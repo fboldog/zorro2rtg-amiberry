@@ -77,14 +77,63 @@ drops the DiagArea from the next reset.
 
 ## Running
 
-```
-hosts/amiberry/build.sh ~/amiberry-picozorro/src picozorro      # an Amiberry with this plugin compiled in
+Three parts, started in this order: the card (flashed, see above), the daemon with this plugin's peer, and
+an Amiberry with the plugin compiled in. All commands are from the repository root.
 
-PICOZORRO_UART=/dev/serial/by-id/usb-Raspberry_Pi_Debugprobe_...-if01 \
+**1. Amiberry with the plugin**, once (and again after a change to the plugin):
+
+```
+hosts/amiberry/build.sh ~/amiberry-picozorro/src picozorro
+```
+
+That gives `~/amiberry-picozorro/src/build/amiberry`. The system Amiberry is not touched.
+
+**2. The daemon.** `z2bridged.py` comes from the Zorro2-Tang25k repository (`sw/tools/host`). `--port none`:
+no Nano bridge, only peers with their own transport. `--peers` points at this repository's `plugins/`, where it
+finds `picozorro/peer.py`. The UART is the probe's UART port: the `-if0N` entry under `/dev/serial/by-id/`
+that is the probe's UART, not its SWD interface (on a multi-port probe, the port the card's GPIO0/1 are wired to).
+
+```
+PICOZORRO_UART=/dev/serial/by-id/usb-Raspberry_Pi_Debugprobe_...-if0N \
   .../Zorro2-Tang25k/zorro2-tang25k/sw/tools/host/z2bridged.py --port none --peers $PWD/plugins
-
-ZBOARD_DAEMON=default ~/amiberry-picozorro/src/build/amiberry -f a2000.uae   # with picozorro_rom_file=:ENABLED
 ```
+
+It listens on `$XDG_RUNTIME_DIR/z2bridge.sock` (else `/tmp/z2bridge-UID.sock`; `--socket PATH` for another)
+and writes its pid next to it. The UART opens when Amiberry connects, not before:
+`peer picozorro: card on ..., 1000000 baud`. While the Amiga works, a statistics line comes whenever the
+counters change: requests, replies, retries, given up, /INT notes, bad frames. The daemon serves one
+Amiberry after another. It stops with `kill $(cat $XDG_RUNTIME_DIR/z2bridge.pid)`.
+
+**3. Amiberry.** Start from [a2000-picozorro-example.uae](a2000-picozorro-example.uae), the bench's config:
+A2000, Kickstart 3.1.4, 68030, 2 MB chip RAM, 8 MB fast RAM. Set its two paths marked `EDIT` (the Kickstart
+ROM and the DH0 drawer). The line that makes the board is `picozorro_rom_file=:ENABLED`. `ZBOARD_DAEMON` tells
+the plugin where the daemon is: `default` for its default socket, or `unix:PATH`.
+
+```
+ZBOARD_DAEMON=default ~/amiberry-picozorro/src/build/amiberry --config plugins/picozorro/a2000-picozorro-example.uae -G
+```
+
+In Amiberry's log (`--log`) a good start reads:
+
+```
+zboard: connected to peer 'picozorro' through .../z2bridge.sock
+picozorro configured at 00ea0000: the card says 2011/$5A, er_Type $D2, serial 31337, boot ROM
+```
+
+The Amiga then loads the drivers from the card's boot ROM. `USBStart picozorrousb.device 0` starts Neptune.
+A Reset from the GUI resets the card too; the log shows a second `picozorro configured` line.
+
+Common faults:
+- `zboard: <socket>: No such file or directory (is z2bridged.py running?)`, then
+  `picozorro configured at ... without the daemon`: the daemon was not running, or `ZBOARD_DAEMON` points
+  elsewhere. The board then reads $FFFF. Start the daemon, then restart Amiberry.
+- `zboard: the daemon at ... has no peer 'picozorro'`: `--peers` does not point at this repository's
+  `plugins/`.
+- `the card did not answer` or `no reply after 4 tries` in the daemon's log: the card is not running the
+  uart-backplane firmware, the UART is the wrong port, TX and RX are not crossed, or a `probe-rs attach` is
+  holding the card.
+- `the card has no boot ROM`: the firmware was built without `firmware/boot.img`. Run with
+  `PICOZORRO_BOOTROM=0`, or rebuild with a boot image.
 
 Networking on the emulated Amiga: [PrismNet.md](PrismNet.md) (the boot ROM's driver and the installer's disk
 copy, the interface, throughput).
