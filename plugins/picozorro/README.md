@@ -111,6 +111,21 @@ the defmt log with the Amiga idle.
 the emulated clock (a timed test, a benchmark, a timeout) therefore runs about 100 times longer in
 wall-clock time: `pztest 5` takes about 20 minutes. Use `pztest 1`.
 
+**Bad frames in the peer's statistics.** A bad frame is something from the card, between two `0x00`
+delimiters, that failed COBS decoding or the CRC16, or was too long. It is dropped. Without RTT a few show up
+in a long session: about 1 per 50,000 requests while idle, rising to about 1 per 1,300 under network load (one
+session: 144 in 426,863 requests).
+
+They cost nothing so far. A damaged reply is always retried, and these runs had no retries at all, so the bad
+frames were /INT notes, which are not retried. The plugin's line `0 /INT releases presumed lost` showed that
+none of them was a release. A lost asserted note is replaced by the card's next repeat, and a lost release is
+covered by the 250 ms rule above.
+
+Why notes and not the much larger replies get hit is not known yet. Random line errors would hit replies
+first. A rate that rises with load points instead to how notes are sent: a note meeting a reply on the card's
+UART, or the probe's UART bridge dropping bytes in bursts. A hex dump of the bad frames in the peer would tell
+which.
+
 ## Tests
 
 ```
