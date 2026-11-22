@@ -99,6 +99,7 @@ board list); it is a 4 MB Zorro II board. With `zbexample` (or another expansion
 |---|---|
 | [`plugins/zorro2rtg`](plugins/zorro2rtg/README.md) | Zorro2RTG, a Zorro II RTG card: its options, its messages and peer (board in the loop) and its tests |
 | [`plugins/zbexample`](plugins/zbexample/README.md) | The example: a 64 KB Zorro II packet mailbox, its peer with its own device, and `zbping` |
+| [`plugins/picozorro`](plugins/picozorro/README.md) | The real PicoZorro card (RP2350, `uart-backplane` firmware) in the loop over a debug probe's UART, flashed over SWD |
 
 ## Tests
 

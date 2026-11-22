@@ -1,0 +1,14 @@
+{
+    "name": "picozorro",
+    "description": "picozorro: the real PicoZorro card (RP2350, uart-backplane firmware) in the loop over a debug probe's UART",
+    "sources": ["picozorro_plugin.cpp"],
+    "headers": [],
+    "amiberry": {
+        "adapter": "expansion",
+        "expansion": {
+            "config_name": "picozorro",
+            "name": "PicoZorro (card in the loop)",
+            "manufacturer_name": "PicoZorro"
+        }
+    }
+}
