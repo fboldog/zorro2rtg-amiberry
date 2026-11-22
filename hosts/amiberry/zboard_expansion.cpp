@@ -99,6 +99,11 @@ bool zboard_exp_init(struct autoconfig_info *aci)
     if (!aci->doinit)
         return true;
     if (zb_boards[0]) {
+        // A hard reset (the GUI's Reset, a config reload) runs the init again while the board lives on:
+        // zbx_reset has already reset it and left it unmapped, and the callbacks are still registered
+        // (Amiberry clears them only at startup), so the same board serves the new Autoconfig.
+        if (zb_boards[0]->api == api)
+            return true;
         write_log(_T("zboard: one %s per configuration\n"), api->desc->name);
         return false;
     }
